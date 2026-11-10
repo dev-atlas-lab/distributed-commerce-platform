@@ -1,6 +1,6 @@
 # ADR-0004: Hybrid Order Fulfillment Saga (Orchestration for Checkout, Choreography for Side Effects)
 
-- **Status:** `PROPOSED`
+- **Status:** `ACCEPTED` (Approved in M0.1)
 - **Date:** 2026-11-10
 - **Deciders:** Human Architect, Solution Architect Agent
 
@@ -12,7 +12,7 @@ Completing an e-commerce order requires coordinating state across four independe
 - **Option B: External Workflow Engine (`Temporal` / `Camunda` / `Conductor`)**.
 - **Option C: Hybrid Saga — State-Machine Orchestration inside `Order Service` for Core Checkout + Event Choreography for Downstream Notifications/Read-Models**.
 
-## 3. Decision
+## 3. Decision (`ACCEPTED`)
 Adopt **Option C**:
 1. **`Order Service` acts as the Saga Orchestrator** for the transactional checkout path (`OrderSagaState` persisted in `order_db`). It tracks whether `Inventory` and `Promotion` reservations succeeded before requesting `Payment`, and drives deterministic compensating actions (`ReleaseStock`, `ReleaseCoupon`, or `RefundPayment` on late webhooks) if any step fails or times out.
 2. **Downstream non-transactional reactions** (`Notification Service` sending emails, `Product Service` updating search availability badges) subscribe via **Event Choreography** so `Order Service` never needs to know about email delivery or search indexing.

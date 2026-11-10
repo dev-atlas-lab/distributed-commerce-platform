@@ -1,6 +1,6 @@
 # ADR-0003: Transactional Outbox Polling Relay & Idempotent Consumer Inbox
 
-- **Status:** `PROPOSED`
+- **Status:** `ACCEPTED` (Approved in M0.1)
 - **Date:** 2026-11-10
 - **Deciders:** Human Architect, Solution Architect Agent
 
@@ -12,7 +12,7 @@ Services must update their own PostgreSQL database and publish domain/integratio
 - **Option B: Debezium CDC + Kafka Connect Cluster** tailing PostgreSQL WAL.
 - **Option C: Transactional Outbox Table + `FOR UPDATE SKIP LOCKED` Polling Relay paired with Consumer Inbox Table (`PRIMARY KEY (event_id, consumer_group)`)**.
 
-## 3. Decision
+## 3. Decision (`ACCEPTED`)
 Adopt **Option C**:
 1. **Producer Side (Transactional Outbox)**: Domain state changes and `INSERT INTO outbox_messages` happen in the same local PostgreSQL ACID transaction. A background relay (`@Scheduled` in Spring Boot / `BackgroundService` in .NET) polls unprocessed rows (`WHERE processed_at IS NULL ORDER BY created_at ASC LIMIT 100 FOR UPDATE SKIP LOCKED`), publishes to Kafka with `acks=all` + `enable.idempotence=true`, and sets `processed_at = NOW()`.
 2. **Consumer Side (Idempotent Inbox)**: Every Kafka consumer writes `INSERT INTO inbox_messages (event_id, consumer_group, event_type, processed_at) VALUES (...) ON CONFLICT DO NOTHING` inside the same local PostgreSQL transaction as its business state update. If `0` rows are inserted into `inbox_messages`, the duplicate message is acknowledged and skipped.

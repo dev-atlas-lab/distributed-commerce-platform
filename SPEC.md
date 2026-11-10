@@ -2,8 +2,8 @@
 
 - **Repository:** `dev-atlas-lab/distributed-commerce-platform`
 - **Organization:** [dev-atlas-lab](https://github.com/dev-atlas-lab)
-- **Milestone:** `M0 — Product Discovery & Architecture`
-- **Status:** `PROPOSED` (Awaiting Human Architect Review & Approval)
+- **Milestone:** `M0.1 — Architecture Baseline Locked & Deep Challenge Review`
+- **Status:** `ACCEPTED` (Core Decisions `Q1–Q7` Accepted; Phase 4 Deep Challenges `CH-01`–`CH-07` `PROPOSED` for Final Gate)
 - **Last Updated:** 2026-11-10
 
 ---
@@ -106,24 +106,16 @@ distributed-commerce-platform/
 
 ---
 
-## 4. Open Questions Requiring Human Architect Decision (`M0 Gate`)
+## 4. Approved Architecture Decisions (`M0.1 — ACCEPTED`) & Phase 4 Deep Challenges (`PROPOSED`)
 
-Before we mark `M0` as `ACCEPTED` and begin `M1`, please review and decide on the following **7 architectural questions**:
+All 7 foundational decisions (`Q1–Q7`) have been reviewed and **approved (`Status: ACCEPTED`)** by the Human Architect:
+1. **Q1 (`ACCEPTED`)**: GitHub repository `dev-atlas-lab/distributed-commerce-platform` created, connected to `/home/anhltn/projects/distributed-commerce-platform/`, and synced on `main`.
+2. **Q2 (`ACCEPTED` — [`ADR-0009`](file:///home/anhltn/projects/distributed-commerce-platform/docs/adr/ADR-0009-on-prem-kubernetes-k3s-vs-kubeadm-and-storage.md))**: 3–4 additional Linux VMs (`2 vCPUs`, `~3.8 GiB RAM`) can be provisioned alongside the current VM (`4–5 VMs` total cluster topology).
+3. **Q3 (`ACCEPTED` — [`ADR-0009`](file:///home/anhltn/projects/distributed-commerce-platform/docs/adr/ADR-0009-on-prem-kubernetes-k3s-vs-kubeadm-and-storage.md))**: Start with **`K3s`** (`--disable traefik --disable servicelb` + standard `MetalLB` + `Ingress-NGINX`) and maintain 100% manifest portability for a later migration to **`kubeadm`**.
+4. **Q4 (`ACCEPTED` — [`ADR-0005`](file:///home/anhltn/projects/distributed-commerce-platform/docs/adr/ADR-0005-flash-sale-concurrency-and-three-tier-locking.md))**: **Option A** — Expired Flash Sale reservations return stock to the active Redis campaign pool if the campaign is still `ACTIVE`, protected by idempotency and reconciliation safeguards.
+5. **Q5 (`ACCEPTED` — [`ADR-0006`](file:///home/anhltn/projects/distributed-commerce-platform/docs/adr/ADR-0006-api-gateway-yarp-and-oidc-jwt-security.md))**: Design standards-compliant **OIDC Discovery (`/.well-known/openid-configuration`, `/.well-known/jwks.json`) + `RS256` JWT** from the beginning in `customer-service`, ready for seamless **Keycloak** introduction later.
+6. **Q6 (`ACCEPTED` — [`ADR-0007`](file:///home/anhltn/projects/distributed-commerce-platform/docs/adr/ADR-0007-catalog-search-postgresql-fts-vs-opensearch.md))**: Start with **PostgreSQL 17 Full-Text Search (`tsvector` + `pg_trgm` + `JSONB` GIN)** and benchmark with `k6` before considering **OpenSearch**.
+7. **Q7 (`ACCEPTED` — [`ADR-0008`](file:///home/anhltn/projects/distributed-commerce-platform/docs/adr/ADR-0008-ai-agent-security-boundary-and-pgvector-rag.md))**: Use a **Multi-Provider AI Abstraction Port** supporting **OpenAI**, **Google Gemini**, and **Anthropic Claude** behind a zero-privilege API-only tool boundary.
 
-1. **Q1 — Repository Location & Git Initialization**:
-   - I created the M0 documentation tree at `/home/anhltn/projects/distributed-commerce-platform/` to match your existing `/home/anhltn/projects/` workspace layout (`backend-visual-lab`, `footlab`). Confirm whether you want me to run `git init -b main` in `/home/anhltn/projects/distributed-commerce-platform/`, or if you will clone `dev-atlas-lab/distributed-commerce-platform` yourself first.
-2. **Q2 — Target On-Prem Linux VM Hardware Inventory**:
-   - The current workspace VM (`vm-anhltn-agy`) is an **ARM64 (`aarch64`) Ubuntu 22.04 VM with 2 vCPUs and 3.8 GiB RAM**.
-   - What are the hardware specs (count of VMs, vCPUs, RAM, disk size, and CPU architecture `x86_64` vs `aarch64`) of the Linux VMs you plan to use for local development (`M1–M5`) and the on-prem Kubernetes cluster (`M6–M7`)?
-3. **Q3 — Kubernetes Distribution Choice (`K3s` vs. `kubeadm` — `ADR-0009`)**:
-   - Do you approve our recommendation of **`K3s` (with bundled Traefik/ServiceLB disabled so we deploy production `MetalLB` + `Ingress-NGINX` + `Calico/Canal`)** to save `~1.2 GiB` control-plane RAM, OR do you want **`kubeadm`** for full manual control-plane/PKI/etcd administration?
-4. **Q4 — Flash Sale Unpaid Expiration Stock Policy (`Proposal P-REQ-03`)**:
-   - When a Flash Sale winner fails to complete payment within the `10-minute` reservation window, should the released unit:
-     - **(Option A — Recommended)**: Automatically return to the live Redis Flash Sale stock counter if the campaign is still within its active time window (and return to standard warehouse `available_qty` if the campaign has ended)?
-     - **(Option B)**: Be held back from the live Redis counter and released in scheduled "Second-Chance Wave" drops (or reconciled back to standard inventory at campaign end)?
-5. **Q5 — Identity Provider Path (`ADR-0006`)**:
-   - Do you approve implementing **`RS256` JWT + `/.well-known/jwks.json` directly inside `Customer Service`** for `M2–M5` (zero extra container overhead, full hands-on auth implementation, 100% OIDC-compatible with Keycloak later), or do you want a **`Keycloak`** container deployed immediately in `M2`?
-6. **Q6 — Product Search Engine Path (`ADR-0007`)**:
-   - Do you approve starting with **PostgreSQL 17 Full-Text Search (`tsvector` + `pg_trgm` + `JSONB` GIN)** behind a clean `ProductSearchRepository` port in `M2–M4` (saving `~2 GiB` RAM), and benchmarking whether **OpenSearch** is needed in `M4/M7`?
-7. **Q7 — LLM Provider for `M5` (`ai-agent-service`)**:
-   - Which primary LLM endpoint do you plan to use when we reach `M5` (e.g., `OpenAI API`, `Google Gemini API`, `Anthropic API`, or a self-hosted `Ollama`/`vLLM` model on a GPU host), so we can size the embedding vector dimension (`768` vs `1536`) in `ai_agent_db` accordingly?
+### Pending Phase 4 Deep Architecture Challenges (`Status: PROPOSED`)
+See [`docs/architecture/ARCHITECTURE_CHALLENGE_M0_1.md`](file:///home/anhltn/projects/distributed-commerce-platform/docs/architecture/ARCHITECTURE_CHALLENGE_M0_1.md) for the 7 concrete edge-case proposals (`CH-01` through `CH-07`) awaiting your decision before we start `M1`.

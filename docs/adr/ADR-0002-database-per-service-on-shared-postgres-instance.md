@@ -1,18 +1,18 @@
 # ADR-0002: Database-per-Service Isolation on a Consolidated PostgreSQL Instance
 
-- **Status:** `PROPOSED`
+- **Status:** `ACCEPTED` (Approved in M0.1)
 - **Date:** 2026-11-10
 - **Deciders:** Human Architect, Solution Architect Agent
 
 ## 1. Context & Problem
-Microservices architecture mandates **Database per Service** so no service can couple to another service's schema or bypass domain invariants. However, spinning up 7 separate PostgreSQL container/VM instances in local development or on a 3–4 VM on-prem cluster consumes `7 × (250–512 MiB)` of shared buffers and background worker memory before a single request is served.
+Microservices architecture mandates **Database per Service** so no service can couple to another service's schema or bypass domain invariants. However, spinning up 7 separate PostgreSQL container/VM instances in local development or on a 4–5 VM on-prem cluster consumes `7 × (250–512 MiB)` of shared buffers and background worker memory before a single request is served.
 
 ## 2. Options Considered
 - **Option A: Shared Database & Shared Schema** (all services connect to `commerce_db.public` with the same credentials).
 - **Option B: 7 Separate PostgreSQL Container Instances** (`postgres-product:5432`, `postgres-order:5433`, etc.).
 - **Option C: 1 PostgreSQL 17 Cluster Hosting 7 Strictly Isolated Databases (`*_db`) with Dedicated Least-Privilege DB Roles (`*_user`)**.
 
-## 3. Decision
+## 3. Decision (`ACCEPTED`)
 Adopt **Option C** for local Docker Compose and small-footprint on-prem Kubernetes deployments (while keeping JDBC/Npgsql connection strings 100% configurable per service so high-load databases like `inventory_db` or `order_db` can be pointed to dedicated PostgreSQL instances at any time without code changes).
 
 An initialization script (`infrastructure/postgres/init-multi-db.sql`) creates:
