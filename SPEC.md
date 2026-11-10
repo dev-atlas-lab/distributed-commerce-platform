@@ -2,8 +2,8 @@
 
 - **Repository:** `dev-atlas-lab/distributed-commerce-platform`
 - **Organization:** [dev-atlas-lab](https://github.com/dev-atlas-lab)
-- **Milestone:** `M0.2 — Architecture Challenge Refinement (CH-01 to CH-07)`
-- **Status:** `ACCEPTED` (Core Decisions `Q1–Q7` Accepted; Refined `CH-01`–`CH-07` Specifications in `PROPOSED` / `DISCUSSION` for Final Gate)
+- **Milestone:** `M0.2.1 — Final Architecture Challenge Corrections (CH-01 to CH-07)`
+- **Status:** `ACCEPTED` (Core Decisions `Q1–Q7` Accepted; `CH-01`, `CH-05`, `CH-07` Direction Approved Pending Final Validation; `CH-02`, `CH-03`, `CH-04`, `CH-06` Final Corrections `PROPOSED`)
 - **Last Updated:** 2026-11-10
 
 ---
@@ -124,12 +124,12 @@ All 7 foundational decisions (`Q1–Q7`) have been reviewed and **approved (`Sta
 6. **Q6 (`ACCEPTED` — [`ADR-0007`](file:///home/anhltn/projects/distributed-commerce-platform/docs/adr/ADR-0007-catalog-search-postgresql-fts-vs-opensearch.md))**: Start with **PostgreSQL 17 Full-Text Search (`tsvector` + `pg_trgm` + `JSONB` GIN)** and benchmark with `k6` before considering **OpenSearch**.
 7. **Q7 (`ACCEPTED` — [`ADR-0008`](file:///home/anhltn/projects/distributed-commerce-platform/docs/adr/ADR-0008-ai-agent-security-boundary-and-pgvector-rag.md))**: Use a **Multi-Provider AI Abstraction Port** supporting **OpenAI**, **Google Gemini**, and **Anthropic Claude** behind a zero-privilege API-only tool boundary.
 
-### Pending `M0.2` Deep Architecture Challenge Refinements (`Status: PROPOSED`)
-See [`docs/architecture/ARCHITECTURE_CHALLENGE_M0_1.md`](file:///home/anhltn/projects/distributed-commerce-platform/docs/architecture/ARCHITECTURE_CHALLENGE_M0_1.md) for the 7 comprehensive `M0.2` engineering specifications (`CH-01` through `CH-07`) awaiting your explicit approval (`Q-CH01` through `Q-CH07`) before we start `M1`:
-- **`CH-01` (`Q-CH01`)**: Flash Sale Two-Phase Claim Lease + **PostgreSQL Tombstone Fencing (`ABANDONED_FENCED`) before Redis Restock** (replacing the 30s timeout assumption) + `HSETNX released_claims` at-most-once restock guard.
-- **`CH-02` (`Q-CH02`)**: Orthogonal **`Order` State Machine** vs. **`Payment` State Machine** (`Auth -> Capture/Void` + `Direct Capture -> Auto-Refund` on late webhook, replacing the 2s clock buffer) + monotonic webhook state precedence ranks.
-- **`CH-03` (`Q-CH03`)**: **Two-Class Idempotency Protocol** (`Class A` single-TX atomic vs. `Class B` checkpointed state machine preserving `downstream_operation_id` across `UNKNOWN_RETRYABLE` timeouts—never deleting records on `5xx` after external side effects) + RFC 8785 canonical `SHA-256` payload hashing.
-- **`CH-04` (`Q-CH04`)**: Mandatory `aggregateVersion` + `outbox_sequence` ordering, explicit ordering boundary matrix, **Terminal Tombstones** for out-of-order cancellations, and state-guarded DLQ replay.
-- **`CH-05` (`Q-CH05`)**: RFC 9068 OIDC token profile, split `AUTH_ISSUER_URI` (logical claim) vs. `AUTH_JWKS_URI` (internal fetch), dual-key JWKS rotation (`ACTIVE_SIGNER` + `VERIFY_ONLY`), and least-privilege scoped `client_credentials` M2M identity.
-- **`CH-06` (`Q-CH06`)**: Generation-isolated **`embedding_index_generations` + `chunk_embeddings`** schema supporting arbitrary model dimensions (`384`, `768`, `1024`, `1536`, `3072`), strict `(provider, model_name, model_version, dimensions)` vector-space isolation, and Blue/Green zero-downtime re-indexing.
-- **`CH-07` (`Q-CH07`)**: OpenTelemetry per-message `traceparent` restoration across Outbox/Inbox + **SpanLink** to batch poller, W3C `baggage` PII allowlist, and dual-gated (`DI registration + ADMIN_OPS chaos:inject scope`) fault injection.
+### Pending `M0.2.1` Deep Architecture Challenge Sign-Off (`Status: PROPOSED`)
+See [`docs/architecture/ARCHITECTURE_CHALLENGE_M0_1.md`](file:///home/anhltn/projects/distributed-commerce-platform/docs/architecture/ARCHITECTURE_CHALLENGE_M0_1.md) for the `M0.2.1` specifications (`CH-01` through `CH-07`) awaiting your final sign-off before we transition to `M1`:
+- **`CH-01` (`PROPOSED` — Direction Approved, Final Validation)**: Single-TX atomicity for all claim DB side effects, PostgreSQL PK index-lock serialization when original writer and reconciler collide, atomic `flash_sale_release.lua` (`HSETNX released_claims` + `INCRBY stock`), `REBUILDING_GATE` Redis failover recovery, and `24h` post-campaign key TTL cleanup.
+- **`CH-02` (`PROPOSED` — Corrected in `M0.2.1`)**: Replaced scalar numeric payment ranks with explicit **`Order` and `PaymentAttempt` State Transition Matrices** + recorded fact timestamps (`authorized_at`, `captured_at`, `voided_at`, `refunded_at`), handling mutually exclusive `CAPTURE` vs. `VOID` branches, out-of-order webhooks, and late capture auto-refunds.
+- **`CH-03` (`PROPOSED` — Corrected in `M0.2.1`)**: Added monotonic **`lease_generation` fencing tokens** and a mandatory **`RECONCILING` state** so an expired lease never re-executes an external side effect without first querying downstream state by `downstream_operation_id`.
+- **`CH-04` (`PROPOSED` — Corrected in `M0.2.1`)**: Added **Head-of-Aggregate Outbox Serialization (`FOR UPDATE SKIP LOCKED` with `NOT EXISTS` earlier unprocessed row)** across concurrent relay workers, distinguished DB `BIGSERIAL` allocation order from commit visibility order, and added consumer sequence-gap detection (`incoming.aggregateVersion > last_applied + 1`).
+- **`CH-05` (`PROPOSED` — Direction Approved, Final Validation)**: Explicitly separated OIDC `id_token` (`aud: "commerce-web-spa"`, SPA-only) from RFC 9068 OAuth2 `access_token` (`aud: "commerce-api"`, Resource Servers), defined the 5-step Keycloak-compatible claim normalization pipeline (`client_id`/`azp`, `roles`/`realm_access.roles`, `scope`), and established the per-service policy matrix.
+- **`CH-06` (`PROPOSED` — Corrected in `M0.2.1`)**: Explicitly distinguished `pgvector` unindexed column limit (`16,000d`) from **HNSW/IVFFlat ANN index ceilings (`2,000d` for FP32 `vector` vs. `4,000d` for FP16 `halfvec`)**, enforced via DB `CHECK` constraint so `3072d` models use `halfvec_cosine_ops` with model-generation isolation.
+- **`CH-07` (`PROPOSED` — Direction Approved, Final Validation)**: Enforced zero-trust on W3C `baggage` (never used for auth/identity), restricted fault injection to server-registered `fault.profile_id` lookups (`fault-profiles.yaml`) with target allowlists and mandatory audit logs, and excluded fault injection in production builds.

@@ -1,30 +1,35 @@
-# ADR-0003: Transactional Outbox Polling Relay, Idempotent Consumer Inbox & Two-Class HTTP Idempotency
+# ADR-0003: Transactional Outbox Relay, Idempotent Inbox & Fenced Two-Class HTTP Idempotency
 
-- **Status:** `ACCEPTED` (Core Outbox/Inbox Pattern Accepted in `M0.1`; `CH-03` & `CH-04` Edge-Case Refinements `PROPOSED` in `M0.2`)
+- **Status:** `ACCEPTED` (Core Outbox/Inbox Pattern Accepted in `M0.1`; `CH-03` & `CH-04` Final Corrections `PROPOSED` in `M0.2.1`)
 - **Date:** 2026-11-10
 - **Deciders:** Human Architect, Solution Architect Agent
 
 ## 1. Context & Problem
-Services must update their own PostgreSQL database and publish domain/integration events to Apache Kafka without the dual-write vulnerability. Additionally:
-1. HTTP mutation endpoints (`POST /orders`, `POST /flash-sales/{id}/claim`, `POST /payments`) must handle concurrent duplicate requests, payload mismatches, and unknown outcomes after network timeouts (`CH-03`).
-2. Kafka consumers must handle duplicate deliveries (`At-Least-Once`) and out-of-order events caused by non-blocking retry topics or DLQ replays (`CH-04`).
+Services must update their own PostgreSQL database and publish integration events to Apache Kafka without dual-write vulnerabilities. Additionally:
+1. **HTTP Idempotency (`CH-03`)**: When a request with an external side effect (Redis Lua or Payment Gateway) times out, an expired lease alone must NEVER authorize re-executing the external side effect without first fencing stale workers (`lease_generation`) and reconciling whether the prior attempt already succeeded downstream.
+2. **Outbox Relay & Consumer Ordering (`CH-04`)**: Multiple Outbox Relay pods polling concurrently with naive `FOR UPDATE SKIP LOCKED` can publish `(O1, v=2)` before `(O1, v=1)`. Furthermore, PostgreSQL `BIGSERIAL` sequence allocation order differs from transaction `COMMIT` visibility order across transactions, and consumers must handle missing version gaps (`incoming.aggregateVersion > last_applied + 1`) alongside stale versions (`<= last_applied`).
 
 ## 2. Options Considered
-- **Option A**: Synchronous Dual Write + Naive `5xx` idempotency key deletion.
+- **Option A**: Naive `FOR UPDATE SKIP LOCKED` across all rows + deleting idempotency keys on `5xx` or retrying blindly on lease expiry.
 - **Option B**: Debezium CDC + Kafka Connect Cluster.
-- **Option C**: **Transactional Outbox (`FOR UPDATE SKIP LOCKED` + `outbox_sequence`) + Consumer Inbox (`PRIMARY KEY (event_id, consumer_group)`) + Two-Class HTTP Idempotency State Machine (`CH-03`) + Aggregate Version / Tombstone Guards (`CH-04`)**.
+- **Option C**: **Head-of-Aggregate Serialized Outbox Relay + Consumer Version Continuity/Tombstone Gate (`CH-04`) + Fenced & Reconciled Two-Class HTTP Idempotency (`CH-03`)**.
 
 ## 3. Decision
 1. **Accepted Baseline (`ACCEPTED`)**:
-   - **Producer Side (Transactional Outbox)**: Domain state changes and `INSERT INTO outbox_messages` happen in the same local PostgreSQL ACID transaction. A background relay polls unprocessed rows (`WHERE processed_at IS NULL ORDER BY outbox_sequence ASC LIMIT 100 FOR UPDATE SKIP LOCKED`), publishes to Kafka with `acks=all` + `enable.idempotence=true`, and sets `processed_at = NOW()`.
-   - **Consumer Side (Idempotent Inbox)**: Every Kafka consumer writes `INSERT INTO inbox_messages (event_id, consumer_group, event_type, processed_at) VALUES (...) ON CONFLICT DO NOTHING` inside the same local PostgreSQL transaction as its business state update.
-2. **Refined Edge-Case Specifications (`PROPOSED` in `M0.2` — See [`ARCHITECTURE_CHALLENGE_M0_1.md`](file:///home/anhltn/projects/distributed-commerce-platform/docs/architecture/ARCHITECTURE_CHALLENGE_M0_1.md))**:
-   - **`CH-03` (Two-Class HTTP Idempotency)**: Never blindly delete idempotency records on `5xx` if an external call (Redis Lua or Payment Gateway) was initiated. Persist `downstream_operation_id` (`claim_id` / `attempt_id`) in `STARTED` state, transition to `UNKNOWN_RETRYABLE` on timeout, and resume with the **same** `downstream_operation_id` on retry. Validate canonical JSON `SHA-256` payload hashes (`422` on mismatch, `409` while `STARTED` lease is active).
-   - **`CH-04` (Aggregate Sequence & Tombstone Guard)**: Every event envelope carries `aggregateVersion`. Out-of-order cancellations arriving before creation insert a `CANCELLED_TOMBSTONE` (`RELEASED`) row so delayed creation events from `.retry.1m` are safely ignored.
+   - Domain state changes and `INSERT INTO outbox_messages` commit atomically in a single local PostgreSQL transaction; consumers deduplicate via `inbox_messages (event_id, consumer_group)`.
+2. **Refined `M0.2.1` Specifications (`PROPOSED` — See [`ARCHITECTURE_CHALLENGE_M0_1.md#ch-03`](file:///home/anhltn/projects/distributed-commerce-platform/docs/architecture/ARCHITECTURE_CHALLENGE_M0_1.md))**:
+   - **`CH-03` (Monotonic `lease_generation` Fencing & `RECONCILING` State)**:
+     - Class B idempotency records assign an immutable `downstream_operation_id` at `lease_generation = 1`.
+     - If a request times out (`UNKNOWN_RETRYABLE`) or its lease expires, a retrying worker increments `lease_generation = lease_generation + 1` (fencing off any zombie worker whose `WHERE lease_generation = :oldGen` update will affect `0` rows) and enters **`RECONCILING`** state.
+     - In `RECONCILING`, the worker queries downstream state by `downstream_operation_id` **before** deciding whether to invoke the external side effect (`INV-IDEM-03`).
+   - **`CH-04` (Head-of-Aggregate Outbox Serialization & Sequence-Gap Handling)**:
+     - Outbox Relay workers lock only the oldest unprocessed head row per `aggregate_id` (`NOT EXISTS (... earlier unprocessed row for same aggregate_id)` with `FOR UPDATE SKIP LOCKED`) and publish each aggregate's pending events in strict `(aggregate_version ASC, outbox_sequence ASC)` order via a Kafka producer configured with `acks=all`, `enable.idempotence=true`, and `max.in.flight.requests.per.connection <= 5`.
+     - Because `processed_at IS NULL` is tracked per row (not via a global sequence watermark), slow-committing transactions with lower `outbox_sequence` numbers are never skipped.
+     - Stateful consumers enforce `aggregateVersion` continuity: `<= last_applied` is ignored as stale; `== last_applied + 1` is applied; `> last_applied + 1` applies a Terminal Tombstone (if cancellation) or routes delta events to `.retry.1m` (`SEQUENCE_GAP_DETECTED`) until the missing version arrives.
 
 ## 4. Consequences & Trade-offs
-- **Positive**: Achieves deterministic **Effectively-Once Business State Mutation** over **At-Least-Once Messaging**, survives out-of-order retry inversions, and prevents double-charges after gateway timeouts.
-- **Negative / Cost**: Adds `1 INSERT + 1 UPDATE` per outgoing event and requires a daily retention purge for `outbox_messages`, `inbox_messages`, and `idempotency_records`.
+- **Positive**: Eliminates multi-pod Outbox ordering inversions; prevents zombie worker overwrites and duplicate external side effects after timeouts.
+- **Negative / Cost**: Requires 1 downstream status query during the rare `RECONCILING` recovery path after a network timeout.
 
 ## 5. Rejected Alternatives
-- **Deleting idempotency records on every `5xx` (`M0.1` draft)**: Rejected in `M0.2` because a `504 Gateway Timeout` after an external side effect has started would allow a retry to execute the side effect a second time.
+- **Re-executing external calls immediately upon lease expiry (`M0.2` draft)**: Rejected in `M0.2.1` because an expired lease does not prove the prior worker's external call failed.

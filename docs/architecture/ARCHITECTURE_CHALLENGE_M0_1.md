@@ -1,589 +1,538 @@
-# Architecture Challenge Refinement (`M0.2` — `CH-01` through `CH-07`)
+# Architecture Challenge Refinement (`M0.2.1` — Final Corrections for `CH-01` through `CH-07`)
 
 - **Document ID:** `DCP-DOC-ARCH-008`
-- **Status:** `DISCUSSION` / `PROPOSED` (Refined in `M0.2` per Human Architect Feedback — Awaiting Explicit Approval)
-- **Preserved Baseline:** Foundational Decisions `Q1–Q7` remain **`ACCEPTED`**.
+- **Status:**
+  - Foundational Decisions (`Q1–Q7`): **`ACCEPTED`**
+  - `CH-01`, `CH-05`, `CH-07`: **`PROPOSED` (Design Direction Approved — Pending Final Validation Sign-Off)**
+  - `CH-02`, `CH-03`, `CH-04`, `CH-06`: **`PROPOSED` (Final Corrections Applied in `M0.2.1` — Pending User Sign-Off)**
 - **Last Updated:** 2026-11-10
 
 ---
 
-## Executive Overview of `M0.2` Refinements
+## Executive Overview of `M0.2.1` Final Corrections
 
-In `M0.1`, seven initial edge-case proposals (`CH-01` through `CH-07`) were surfaced. During review, the Human Architect identified critical theoretical and operational shortcuts in those initial proposals—such as assuming a 30-second timeout proves a PostgreSQL transaction never committed (`CH-01`), relying on a 2-second clock buffer for payment expiry (`CH-02`), deleting idempotency keys on `5xx` responses (`CH-03`), assuming uniform `vector(768)` dimensions or cross-model vector compatibility (`CH-06`), and conflating parent-child spans with async Outbox batching (`CH-07`).
-
-This document provides the rigorous **`M0.2` engineering specification** for all seven challenges. Every challenge is documented across **9 mandatory dimensions**:
-1. **Problem**
-2. **Failure Scenarios**
-3. **Invariants That Must Always Hold**
-4. **Proposed Design (with Mermaid State Machines & Sequence Flows)**
-5. **Alternatives Evaluated**
-6. **Trade-offs**
-7. **Recovery Strategy**
-8. **Acceptance Criteria**
-9. **Remaining Questions for Human Architect Decision**
-
-> [!IMPORTANT]
-> Per strict governance rules, **none of the refined `CH-01`–`CH-07` designs in this document are marked `ACCEPTED`**. They are presented in `DISCUSSION` / `PROPOSED` status for your explicit sign-off.
+Following the `M0.2` review, the Human Architect approved the overall direction of `CH-01`, `CH-05`, and `CH-07` subject to final operational clarifications, and mandated targeted technical corrections for `CH-02`, `CH-03`, `CH-04`, and `CH-06`:
+1. **`CH-01`**: Explicitly verify single-transaction atomicity of all claim DB side effects, trace PostgreSQL row-lock waiting when the original writer and reconciler collide concurrently, provide the complete atomic `flash_sale_release.lua` script, and document Redis persistence/failover assumptions (`WAIT`, AOF `everysec`) and `released_claims` TTL cleanup.
+2. **`CH-02`**: **Eliminate scalar numeric payment state ranks (`10..100`)**. Replace them with an explicit **Directed Acyclic Transition Matrix (`AllowedTransitions`) + Recorded Fact Flags** (`authorized_at`, `captured_at`, `voided_at`, `refunded_at`) so mutually exclusive branches (`AUTHORIZED -> CAPTURED` vs. `AUTHORIZED -> VOIDED`) cannot overwrite one another.
+3. **`CH-03`**: **Add monotonic Lease Generation / Fencing Tokens (`lease_generation BIGINT`)** and prove why **an expired lease alone NEVER authorizes re-executing an external side effect**. Define pre-retry **Unknown-Outcome Reconciliation (`RECONCILING` state)** and downstream idempotency requirements.
+4. **`CH-04`**: **Solve Outbox Relay multi-worker ordering inversions**. Distinguish `BIGSERIAL` sequence allocation order from PostgreSQL `COMMIT` visibility order, enforce **per-aggregate publication serialization** across concurrent relay workers, specify exact Kafka Producer (`acks=all`, `enable.idempotence=true`, `max.in.flight.requests.per.connection <= 5`) guarantees, and handle **sequence gaps (`incoming.aggregateVersion > last_applied_version + 1`)** alongside stale events (`<= last_applied_version`).
+5. **`CH-05`**: Explicitly distinguish **OIDC Identity (`id_token`)** from **OAuth2 Resource Authorization (`RFC 9068` JWT `access_token`)**, specify exact `iss`, `aud`, `scope`, `client_id`, `azp`, and role-claim normalization rules for seamless **Keycloak** migration, and define per-service authorization policies.
+6. **`CH-06`**: **Correct `pgvector` physical index limits**. Explicitly distinguish maximum stored dimensions (`16,000` for `vector`) from **maximum ANN-indexed dimensions (`2,000` for float32 `vector` vs. `4,000` for float16 `halfvec` in HNSW/IVFFlat)**. Document why a `3072`-dimensional embedding (`text-embedding-3-large`) **cannot** use a normal `vector_cosine_ops` HNSW index and must use `halfvec_cosine_ops` (`(embedding::halfvec(3072))`) or Matryoshka dimension reduction, along with FP16 recall trade-offs.
+7. **`CH-07`**: Enforce that **W3C `baggage` is NEVER an authorization or identity carrier**, restrict fault injection to **pre-registered server-side `fault.profile_id` lookups** (never parsing arbitrary client delay/status parameters from headers), enforce compile/startup exclusion in production, and require mandatory target allowlists and audit logs.
 
 ---
 
-## `CH-01`: Redis / PostgreSQL Flash Sale Claim Lifecycle & Reconciliation Correctness
+## `CH-01`: Redis / PostgreSQL Flash Sale Claim Lifecycle, Fenced Reconciliation & Redis Failover
 
-- **Status:** `PROPOSED` (`M0.2` Revision — Supersedes `M0.1` 30s Timeout Assumption)
+- **Status:** `PROPOSED` (Design Direction Approved — Final Validation in `M0.2.1`)
 - **Related ADR:** [`ADR-0005`](file:///home/anhltn/projects/distributed-commerce-platform/docs/adr/ADR-0005-flash-sale-concurrency-and-three-tier-locking.md)
 
-### 1. Problem
-During a Flash Sale (`Q4 Option A — ACCEPTED`), Redis serves as the high-speed admission gate while PostgreSQL (`promotion_db` and `order_db`/`inventory_db`) is the durable system of record. Because Redis and PostgreSQL do not share a distributed 2PC transaction, any multi-step mutation across them is vulnerable to **split-brain uncertainty**:
-1. **Why a 30-second timeout NEVER proves a DB transaction failed**: Suppose Pod A executes `flash_sale_claim.lua` in Redis at `T = 0s`, then sends `INSERT INTO flash_sale_claims ... COMMIT` to PostgreSQL. If Pod A experiences a 35-second JVM/.NET GC pause, network packet delay, or PostgreSQL connection stall right as the `COMMIT` packet is in flight, a reconciler that blindly rolls back the Redis slot at `T = 30s` (because it sees no DB row at `T = 30s`) will return the unit to Redis (`INCRBY stock 1`). Another user (`User B`) buys that unit at `T = 31s`. Then at `T = 32s`, Pod A's delayed PostgreSQL `COMMIT` lands on disk! Now **both User A and User B have committed claims for the same unit (`OVERSELL!`)**.
-2. **Concurrent Expiration vs. Cancellation / Payment**: If an unpaid reservation expires at `T = 10m` (`Q4 Option A` returns stock to the active Redis pool) at the exact millisecond the user cancels or completes payment, or if a release event is delivered twice by Kafka, naive stock return increments Redis stock twice.
+### 1. Problem & Atomic DB Transaction Boundary
+When a user claims a Flash Sale slot, Redis executes the fast admission gate (`flash_sale_claim.lua`) and returns a leased `claim_id`. Subsequently, `Promotion Service` persists the claim in PostgreSQL.
+- **Mandatory Single-Transaction Atomicity**: In `promotion_db`, **all** claim-related database side effects MUST be committed inside a **single local PostgreSQL ACID transaction**:
+  1. `INSERT INTO flash_sale_claims (claim_id, status='CLAIMED_RESERVED', ...)`
+  2. `UPDATE flash_sale_items SET claimed_count = claimed_count + :qty WHERE item_id = :itemId AND claimed_count + :qty <= allocated_quota`
+  3. `INSERT INTO outbox_messages (event_type='commerce.flashsale.slot_claimed.v1', aggregate_id=claim_id, ...)`
+  4. `UPDATE idempotency_records SET status='COMPLETED_SUCCESS', response_payload=...`
+  - **Zero partial DB state is possible**: Either all four rows commit atomically, or all four roll back.
 
-### 2. Failure Scenarios
-
-| ID | Failure Scenario | Naive Failure Outcome | Required Safe Outcome |
-| :--- | :--- | :--- | :--- |
-| `FS-01A` | Redis Lua claim succeeds (`INTENT_RESERVED`), then Pod crashes (`kill -9`) before sending SQL `INSERT` to PostgreSQL. | Stock leaked in Redis; user locked out on retry (`USER_LIMIT_EXCEEDED`). | Same `(customerId, Idempotency-Key)` retry re-hydrates the existing `claimId` from Redis and completes DB persistence; if user never retries, lease expires only after DB fence makes late commit impossible. |
-| `FS-01B` | Redis Lua claim succeeds, Pod sends SQL `INSERT`, network stalls for `35s`; reconciler runs while SQL commit is still in flight. | Reconciler releases Redis stock early → User B buys it → Pod A's delayed SQL commit succeeds → **Oversell**. | Reconciler MUST write a **`RECONCILED_ABORT` tombstone** to PostgreSQL *before* returning stock to Redis, fencing off any delayed in-flight SQL commit via primary/unique key conflict. |
-| `FS-01C` | Reservation expiry worker and user cancellation worker both process `claimId` concurrently while campaign is `ACTIVE`. | Both workers call `INCRBY stock 1` in Redis → **Oversell** (`stock` inflated by `+2` instead of `+1`). | State transition in PostgreSQL (`CLAIMED_RESERVED -> EXPIRED` vs `CANCELLED`) wins once via atomic SQL `WHERE status = 'CLAIMED_RESERVED'`, AND Redis Lua release checks `HSETNX released_claims {claimId}`. |
-| `FS-01D` | Kafka delivers `FlashSaleClaimReleased` event twice (`At-Least-Once` redelivery). | Second delivery increments Redis stock again → **Oversell**. | Redis Lua `HSETNX released_claims {claimId}` is idempotent; second call returns `ALREADY_RELEASED` with `0` stock delta. |
-
-### 3. Invariants That Must Always Hold
-- **`INV-FS-01 (Conservation of Campaign Quota)`**: At any instant $t$:
-  $$\text{RedisAvailableStock}(t) + |\text{ActiveIntentLeases}(t)| + |\text{CommittedOrReservedClaims}(t)| = \text{AllocatedQuota}$$
-- **`INV-FS-02 (Write-Fence Before Restock)`**: No unpersisted Redis claim intent may ever be returned to `RedisAvailableStock` unless PostgreSQL has first durably recorded a terminal `ABANDONED` / `EXPIRED` tombstone for that `claim_id` (guaranteeing that any delayed in-flight `INSERT/UPDATE` for that `claim_id` will deterministically fail on PostgreSQL constraints).
-- **`INV-FS-03 (At-Most-Once Restock per Claim ID)`**: A given `claim_id` can increment `RedisAvailableStock` at most once across the entire lifetime of the campaign.
-- **`INV-FS-04 (Per-Customer Quota Invariant)`**: A customer's net active claims (`INTENT_RESERVED` + `DB_PERSISTED` + `ORDER_PAID`) for `(campaign_id, sku_id)` must never exceed `per_customer_limit`.
-
-### 4. Proposed Design: Two-Phase Claim Lease with PostgreSQL Tombstone Fencing
-
-#### 4.1 Ownership Boundary (Redis vs. PostgreSQL)
-- **Redis Owns**: High-speed admission control (`available_stock` counter, active `claim_intents` hash, per-user active claim counter, and idempotent `released_claims` set during the active campaign window).
-- **PostgreSQL (`promotion_db.flash_sale_claims`) Owns**: The **authoritative lifecycle state machine** and **fencing ledger**. Whether a claim is ultimately valid, expired, cancelled, or abandoned is decided by a single row in `promotion_db.flash_sale_claims (claim_id PRIMARY KEY)`.
-
-#### 4.2 Durable Identifiers & Uniqueness Constraints
-- **`claim_id` (`UUIDv7`)**: Generated deterministically or assigned at the start of the request and bound 1:1 to `(campaign_id, sku_id, customer_id, idempotency_key)`.
-- **PostgreSQL Schema (`promotion_db.flash_sale_claims`)**:
-  ```sql
-  CREATE TABLE flash_sale_claims (
-      claim_id                UUID PRIMARY KEY,
-      campaign_id             UUID NOT NULL REFERENCES flash_sale_campaigns(campaign_id),
-      sku_id                  UUID NOT NULL,
-      customer_id             UUID NOT NULL,
-      idempotency_key         VARCHAR(128) NOT NULL,
-      quantity                INTEGER NOT NULL CHECK (quantity > 0),
-      status                  VARCHAR(32) NOT NULL CHECK (status IN (
-                                  'CLAIMED_RESERVED',
-                                  'ORDER_MATERIALIZED',
-                                  'PAYMENT_CONFIRMED',
-                                  'CANCELLED',
-                                  'EXPIRED',
-                                  'ABANDONED_FENCED'
-                              )),
-      intent_lease_expires_at TIMESTAMPTZ NOT NULL,
-      payment_expires_at      TIMESTAMPTZ NOT NULL,
-      stock_returned_to_redis BOOLEAN NOT NULL DEFAULT FALSE,
-      version                 BIGINT NOT NULL DEFAULT 0,
-      created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      CONSTRAINT uq_flash_claim_idem UNIQUE (campaign_id, customer_id, idempotency_key)
-  );
-
-  -- Partial unique index: a customer can hold at most 1 active (non-terminal) claim when per_customer_limit = 1
-  CREATE UNIQUE INDEX uq_flash_active_customer_sku
-      ON flash_sale_claims (campaign_id, sku_id, customer_id)
-      WHERE status IN ('CLAIMED_RESERVED', 'ORDER_MATERIALIZED', 'PAYMENT_CONFIRMED');
-  ```
-
-#### 4.3 Claim State Machine (Mermaid)
+### 2. Concurrent Collision Analysis: Original Writer vs. Reconciler Tombstone Fence
+What happens when the Original Writer (`Worker W1`, delayed by a long GC/network pause) and the Reconciler (`Worker R1`, running after `intent_lease_expires_at`) hit PostgreSQL **at the exact same millisecond** for the same `claim_id`?
 
 ```mermaid
-stateDiagram-v2
-    [*] --> REDIS_INTENT_LEASED : Step 1: flash_sale_claim.lua (Redis atomic decrement + lease TTL)
-    REDIS_INTENT_LEASED --> CLAIMED_RESERVED : Step 2: PG INSERT status='CLAIMED_RESERVED' + Outbox(FlashSaleSlotClaimed)
-    REDIS_INTENT_LEASED --> ABANDONED_FENCED : Reconciler fences expired intent in PG BEFORE releasing Redis stock
-    CLAIMED_RESERVED --> ORDER_MATERIALIZED : Order & StockReservation created (10m payment lease)
-    CLAIMED_RESERVED --> CANCELLED : User cancels before order materialization (PG fence -> Redis release)
-    CLAIMED_RESERVED --> EXPIRED : Payment TTL expires (PG fence -> Redis release if campaign ACTIVE)
-    ORDER_MATERIALIZED --> PAYMENT_CONFIRMED : PaymentSucceeded (Terminal Success)
-    ORDER_MATERIALIZED --> CANCELLED : User cancels order (PG fence -> Redis release if campaign ACTIVE)
-    ORDER_MATERIALIZED --> EXPIRED : 10m Payment TTL expires (PG fence -> Redis release if campaign ACTIVE)
-    ABANDONED_FENCED --> [*] : Redis stock restored (at-most-once via HSETNX released_claims)
-    CANCELLED --> [*] : Redis stock restored (if campaign ACTIVE) or Warehouse reconciled
-    EXPIRED --> [*] : Redis stock restored (if campaign ACTIVE) or Warehouse reconciled
-    PAYMENT_CONFIRMED --> [*]
+sequenceDiagram
+    autonumber
+    participant W1 as Original Claim Worker (Delayed)
+    participant PG as PostgreSQL (promotion_db)
+    participant R1 as Reconciler Worker (Lease Expired)
+    participant Redis as Redis 7.4 (Lua Engine)
+
+    Note over W1,R1: Case A: Original Worker acquires PK index lock on claim_id FIRST (T = 60.001s)
+    W1->>PG: BEGIN; INSERT flash_sale_claims (claim_id=C1, status='CLAIMED_RESERVED') + Outbox
+    R1->>PG: INSERT flash_sale_claims (claim_id=C1, status='ABANDONED_FENCED') ON CONFLICT (claim_id) DO NOTHING
+    Note over PG,R1: PG blocks R1 on C1's uncommitted PK index tuple until W1 finishes!
+    W1->>PG: COMMIT (C1 is now durably 'CLAIMED_RESERVED')
+    PG-->>R1: Unblocks R1 -> ON CONFLICT DO NOTHING returns 0 rows inserted!
+    R1->>PG: SELECT status FROM flash_sale_claims WHERE claim_id=C1 -> 'CLAIMED_RESERVED'
+    R1->>Redis: HDEL intents C1 (Clears stale intent; DOES NOT increment Redis stock!)
+
+    Note over W1,R1: Case B: Reconciler acquires PK index lock on claim_id FIRST (T = 60.001s)
+    R1->>PG: BEGIN; INSERT flash_sale_claims (claim_id=C1, status='ABANDONED_FENCED'); COMMIT;
+    W1->>PG: INSERT flash_sale_claims (claim_id=C1, status='CLAIMED_RESERVED') ...
+    PG-->>W1: ERROR 23505: duplicate key value violates unique constraint "flash_sale_claims_pkey"
+    Note over W1: W1 transaction aborts & rolls back Outbox message!
+    R1->>Redis: EVALSHA flash_sale_release.lua (HSETNX released_claims C1 -> INCRBY stock)
 ```
 
-#### 4.4 How Safe Reconciliation Works (Eliminating the 30s Timeout Fallacy)
-Instead of assuming that an old Redis intent was never persisted, the **Reconciliation & Recovery Protocol** enforces **PostgreSQL Fencing First**:
-1. **Step 1 (Redis Admission Lease)**: `flash_sale_claim.lua` atomically records an intent entry in Redis hash `flashsale:{campaignId}:sku:{skuId}:intents` keyed by `claimId` containing `{customerId, idempotencyKey, qty, leaseDeadlineMs = now + 60000}` and decrements `stock`.
-   - Set statement timeout on the subsequent PostgreSQL `INSERT` to `5 seconds` (`SET LOCAL statement_timeout = '5s'`).
-2. **Step 2 (Normal Path Confirmation)**: `Promotion Service` inserts `flash_sale_claims (claim_id, status = 'CLAIMED_RESERVED', ...)` + `outbox_messages (FlashSaleSlotClaimed)` in PostgreSQL (`<= 5s`). Once committed, it calls a lightweight Redis Lua ack (`HDEL intents {claimId}`, moving it to confirmed buyers).
-3. **Step 3 (Fenced Reconciliation for Unacknowledged Intents past `leaseDeadlineMs`)**:
-   - When the Reconciler finds an unacknowledged Redis intent where `now > leaseDeadlineMs` (`60s`, well past the `5s` PostgreSQL `statement_timeout`), it **DOES NOT touch Redis yet**.
-   - First, the Reconciler queries/mutates **PostgreSQL**:
-     ```sql
-     INSERT INTO flash_sale_claims (
-         claim_id, campaign_id, sku_id, customer_id, idempotency_key,
-         quantity, status, intent_lease_expires_at, payment_expires_at
-     ) VALUES (
-         :claimId, :campaignId, :skuId, :customerId, :idempotencyKey,
-         :qty, 'ABANDONED_FENCED', :leaseExp, :leaseExp
-     )
-     ON CONFLICT (claim_id) DO NOTHING
-     RETURNING status;
-     ```
-   - **Outcome A (`INSERT` succeeded and inserted `ABANDONED_FENCED`)**: Now PostgreSQL has a durable tombstone row for `claim_id`! Even if a zombie thread from 60 seconds ago somehow woke up and tried to `INSERT` `CLAIMED_RESERVED` for `claim_id`, PostgreSQL's `PRIMARY KEY (claim_id)` will **reject the zombie write**! Now—and ONLY now—is it 100% safe for the Reconciler to execute `flash_sale_release.lua` in Redis (`HSETNX released_claims {claimId}` + `INCRBY stock qty`) and set `stock_returned_to_redis = true`.
-   - **Outcome B (`ON CONFLICT DO NOTHING` returned 0 rows because `claim_id` ALREADY exists in PostgreSQL as `CLAIMED_RESERVED`!)**: The Reconciler discovers the DB commit actually succeeded earlier (only the Redis ack was lost). It simply clears the stale Redis intent key **without** returning stock!
+- **Why PostgreSQL's Index Lock Guarantees Mutual Exclusion**: In PostgreSQL, two concurrent `INSERT` statements with the same `PRIMARY KEY (claim_id)` never race silently: the second statement to reach the B-Tree index page sees the first transaction's uncommitted `xmin` on the index tuple and **waits on the first transaction's `XID` lock** until the first transaction either `COMMIT`s or `ROLLBACK`s.
 
-### 5. Alternatives Evaluated
-- **Alternative 1 (Pre-insert to PostgreSQL before Redis Lua)**: Impossible at 100K RPS spike load because PostgreSQL would have to absorb 100,000 `INSERT` transactions per second just to reject 99,000 losers.
-- **Alternative 2 (Wait until Campaign Ends to Reconcile Orphaned Intents)**: Safe against overselling, but strands leaked units until the campaign is over instead of returning them to active shoppers (`Q4 Option A`).
+### 3. Atomic Redis Lua Release Script (`flash_sale_release.lua`)
+To guarantee that **deduplication (`released_claims`)** and **stock increment (`INCRBY`)** execute atomically with zero race window:
 
-### 6. Trade-offs
-- **PostgreSQL Tombstone Fencing (Proposed)** adds `1` PostgreSQL `INSERT ... ON CONFLICT` per crashed/abandoned Redis intent (which only occurs on pod crashes or network faults, i.e., `<0.01%` of claims) while providing a **mathematical proof against split-brain overselling**.
+```lua
+-- KEYS[1]: flashsale:{campaignId}:sku:{skuId}:meta            (Hash: allocated_quota, status, end_ts)
+-- KEYS[2]: flashsale:{campaignId}:sku:{skuId}:stock           (String: integer available stock)
+-- KEYS[3]: flashsale:{campaignId}:sku:{skuId}:buyers          (Hash: customerId -> active_claimed_qty)
+-- KEYS[4]: flashsale:{campaignId}:sku:{skuId}:intents         (Hash: claimId -> intent metadata)
+-- KEYS[5]: flashsale:{campaignId}:sku:{skuId}:released_claims (Hash: claimId -> release_timestamp_ms)
+-- ARGV[1]: claim_id
+-- ARGV[2]: customer_id
+-- ARGV[3]: release_qty
+-- ARGV[4]: now_epoch_ms
 
-### 7. Recovery Strategy
-- **If Redis crashes/restarts mid-campaign**: Campaign temporarily pauses (`status = REBUILDING_GATE` returning `503 Retry-After: 5`), reconstructs exact Redis state (`allocated_quota - COUNT(active/paid claims in PG)` and active buyer hashes) from `promotion_db.flash_sale_claims`, and resumes `ACTIVE`.
+-- 1. Idempotency Guard: Has this claim_id already been released?
+local is_new_release = redis.call('HSETNX', KEYS[5], ARGV[1], ARGV[4])
+if is_new_release == 0 then
+    redis.call('HDEL', KEYS[4], ARGV[1])
+    return {0, 'ALREADY_RELEASED'}
+end
 
-### 8. Acceptance Criteria
-1. **Crash Before DB Commit Test**: Inject fault after `flash_sale_claim.lua` before PG `INSERT`. Verify client retry with same `Idempotency-Key` succeeds using the same `claimId`, OR if unretried past lease deadline, Reconciler inserts `ABANDONED_FENCED` in PG before restoring Redis stock (`INV-FS-01` & `INV-FS-02`).
-2. **Zombie Delayed Commit Test**: Simulate a stalled DB writer thread attempting to commit `CLAIMED_RESERVED` *after* the Reconciler has fenced `claim_id` as `ABANDONED_FENCED`. Verify PostgreSQL rejects the zombie commit with a primary-key violation and `0` oversell occurs.
-3. **Concurrent Expiry + Cancel Test**: Trigger expiration worker and user cancel API on the same `claimId` at the same millisecond via a `CyclicBarrier`. Verify Redis stock is incremented **exactly once** (`INV-FS-03`).
+-- 2. Always remove from active intents if present
+redis.call('HDEL', KEYS[4], ARGV[1])
 
-### 9. Remaining Questions for Human Architect
-- **`Q-CH01`**: Do you approve the **PostgreSQL Tombstone Fencing (`ABANDONED_FENCED`) before Redis Restock** protocol and the 6-state `FlashSaleClaim` lifecycle?
+-- 3. Decrement customer's active claimed count (floor at 0)
+local req_qty = tonumber(ARGV[3])
+local prev_user_qty = tonumber(redis.call('HGET', KEYS[3], ARGV[2]) or '0')
+if prev_user_qty <= req_qty then
+    redis.call('HDEL', KEYS[3], ARGV[2])
+else
+    redis.call('HINCRBY', KEYS[3], ARGV[2], -req_qty)
+end
+
+-- 4. Only restore stock to live Redis counter if campaign is still ACTIVE and within window
+local status = redis.call('HGET', KEYS[1], 'status')
+local end_ts = tonumber(redis.call('HGET', KEYS[1], 'end_ts') or '0')
+local now_ts = tonumber(ARGV[4])
+local quota  = tonumber(redis.call('HGET', KEYS[1], 'allocated_quota') or '0')
+
+if status == 'ACTIVE' and now_ts < end_ts then
+    local current_stock = tonumber(redis.call('GET', KEYS[2]) or '0')
+    local new_stock = math.min(quota, current_stock + req_qty)
+    redis.call('SET', KEYS[2], tostring(new_stock))
+    return {1, 'RESTOCKED_TO_ACTIVE_POOL', new_stock}
+else
+    return {2, 'CAMPAIGN_ENDED_RECONCILE_TO_WAREHOUSE', 0}
+end
+```
+
+### 4. Redis Persistence, Failover Assumptions & `released_claims` Retention
+1. **Honest Redis Persistence & Failover Disclosure**:
+   - Redis is configured with **`appendonly yes` (`appendfsync everysec`)** + RDB snapshots. Under a sudden Linux kernel panic or power loss on the stateful node, up to `1 second` of un-fsynced Redis mutations can be lost on disk.
+   - **Why Redis Failover Never Causes Silent Oversell**: If Redis restarts or fails over to a replica that is missing the last `1 second` of decrements, `Promotion Service` detects the missing/cold script or epoch mismatch (`flashsale:{campaignId}:epoch`) and flips the campaign gate to **`REBUILDING_GATE` (`503 Retry-After: 5`)**. A recovery routine queries PostgreSQL (`SELECT COUNT(*), COALESCE(SUM(quantity),0) FROM flash_sale_claims WHERE campaign_id = :id AND status IN ('CLAIMED_RESERVED', 'ORDER_MATERIALIZED', 'PAYMENT_CONFIRMED')`), sets Redis `stock = allocated_quota - db_committed_qty - safety_margin`, repopulates `buyers` and `released_claims` from PostgreSQL, increments `epoch`, and resumes `ACTIVE`.
+2. **`released_claims` Memory Bound & Campaign Cleanup**:
+   - Each entry in `flashsale:{campaignId}:sku:{skuId}:released_claims` is `~56 bytes` (`UUID` -> `timestamp`). Even if `5,000` claims expire/cancel during a campaign, the hash consumes `< 300 KB` of Redis memory.
+   - When a campaign transitions to `ENDED` and finishes final warehouse reconciliation (`RECONCILED`), `Promotion Service` sets an explicit Redis TTL (`EXPIRE ... 86400` — `24 hours` after `end_ts`) on all `5` campaign keys (`meta`, `stock`, `buyers`, `intents`, `released_claims`), guaranteeing zero long-term Redis memory leak.
+
+### 5. Invariants & Acceptance Criteria (`CH-01`)
+- **`INV-FS-01`**: $\text{RedisAvailableStock}(t) + |\text{ActiveIntentLeases}(t)| + |\text{ActiveAndPaidDBClaims}(t)| \le \text{AllocatedQuota}$.
+- **`INV-FS-02`**: No Redis intent lease may be restocked to Redis without first committing `ABANDONED_FENCED` (or `EXPIRED`/`CANCELLED`) in PostgreSQL `flash_sale_claims` inside an atomic transaction.
+- **`INV-FS-03`**: `HSETNX released_claims {claimId}` guarantees at-most-once Redis stock restoration per `claim_id`, capped at `allocated_quota`.
+- **Acceptance Criteria**:
+  1. **Concurrent Writer + Reconciler Lock Test**: Pause `Worker W1` right before `INSERT INTO flash_sale_claims` commits; trigger `Reconciler R1` `INSERT ... ON CONFLICT DO NOTHING`. Verify PostgreSQL serializes the two via the PK index lock so either `CLAIMED_RESERVED` wins (and `0` stock is returned to Redis) or `ABANDONED_FENCED` wins (and `W1` rolls back with `23505`).
+  2. **Redis Restart Reconstruction Test**: Flush/restart Redis mid-campaign after 300 claims are committed in PostgreSQL; verify the gate enters `REBUILDING_GATE`, reconstructs `stock = quota - 300` from PostgreSQL, and completes the campaign with `0` oversold units.
+  3. **Post-Campaign Key TTL Test**: Transition campaign to `RECONCILED` and verify `TTL` on all `5` `flashsale:{campaignId}:*` keys is set to `<= 86400s`.
 
 ---
 
-## `CH-02`: Decoupled Order Lifecycle vs. Payment Lifecycle & Webhook Race Resolution
+## `CH-02`: Decoupled Order & Payment State Machines with Explicit Transition Matrices
 
-- **Status:** `PROPOSED` (`M0.2` Revision — Supersedes `M0.1` 2-Second Buffer Assumption)
-- **Related ADRs:** [`ADR-0004`](file:///home/anhltn/projects/distributed-commerce-platform/docs/adr/ADR-0004-hybrid-order-fulfillment-saga-orchestration.md), [`ADR-0005`](file:///home/anhltn/projects/distributed-commerce-platform/docs/adr/ADR-0005-flash-sale-concurrency-and-three-tier-locking.md)
+- **Status:** `PROPOSED` (`M0.2.1` Final Correction — Scalar Ranks Replaced by Explicit Transition Graph)
+- **Related ADR:** [`ADR-0004`](file:///home/anhltn/projects/distributed-commerce-platform/docs/adr/ADR-0004-hybrid-order-fulfillment-saga-orchestration.md)
 
-### 1. Problem
-In `M0.1`, we suggested a "2-second pre-capture expiry buffer" in `Payment Service`. As you rightly challenged, **wall-clock buffers are never a correctness guarantee in distributed systems** (network pauses, GC pauses, clock skew, or asynchronous external payment gateway webhooks can exceed 2 seconds, 30 seconds, or 10 minutes).
-Furthermore, conflating the **Order Lifecycle** (commercial fulfillment contract & inventory reservation) with the **Payment Lifecycle** (financial authorization, capture, void, refund, and settlement ledger) makes it impossible to reason cleanly about:
-- Out-of-order webhooks (`CAPTURED` webhook arriving before `AUTHORIZED` webhook).
-- Duplicate webhooks (`CAPTURED` delivered 3 times).
-- Late payment webhooks arriving after the Order's inventory reservation has already expired and been sold to another customer.
-- Multiple payment attempts on the same Order (Attempt #1 fails with card declined; Attempt #2 succeeds).
+### 1. Problem: Why Scalar Monotonic Ranks Are Flawed for Payment States
+In `M0.2`, we proposed numeric precedence ranks (`INITIATED=10, AUTHORIZED=20, CAPTURED=30, VOIDED=90, REFUNDED=100`). As you identified, **payment states form a branching Directed Acyclic Graph (DAG), NOT a total linear order**:
+- `CAPTURED` and `VOIDED` are **mutually exclusive branches** from `AUTHORIZED`! If `VOIDED` had rank `90` and `CAPTURED` had rank `30`, a late or erroneously emitted `void` event would appear to have a "higher rank" than `CAPTURED` (even though you can never void an already-captured charge—you must refund it!). Conversely, if a payment is already `VOIDED`, a late `captured` webhook represents an **anomaly/conflict requiring immediate refund/alert**, not a lower-rank no-op!
 
 ### 2. Failure Scenarios
 
-| ID | Failure Scenario | Naive Failure Outcome | Required Safe Outcome |
+| ID | Failure Scenario | Flawed Scalar-Rank Outcome | Explicit Transition Matrix Outcome |
 | :--- | :--- | :--- | :--- |
-| `FS-02A` | Order expires at `T = 10m00s` (stock released to pool), and external gateway sends `webhook: payment.captured` at `T = 10m05s`. | Order either flips `EXPIRED -> CONFIRMED` (overselling released stock!) OR ignores webhook (stealing customer's money!). | `Order` stays terminal `EXPIRED` (stock safe); `Payment` records `CAPTURED` and Saga immediately triggers compensating `REFUND_INITIATED -> REFUNDED`. |
-| `FS-02B` | Two-step payment (`AUTHORIZE` then `CAPTURE`): Order expires while payment is `AUTHORIZED` (funds held, not yet captured). | System issues a full refund on uncaptured funds (fails at gateway) or leaves hold hanging on customer card. | `Order Service` emits `CancelPaymentAuthorization`; `Payment Service` executes an **Authorization `VOID`** instead of a capture/refund. |
-| `FS-02C` | Out-of-order webhook: `payment.captured` webhook arrives 100ms *before* `payment.authorized` webhook. | State machine rejects `payment.captured` because current status is `INITIATED`, losing the payment notification! | Payment state machine uses **monotonic state precedence** (`CAPTURED > AUTHORIZED > INITIATED`): `INITIATED` transitions directly to `CAPTURED`, and the late `payment.authorized` webhook is recorded in `payment_webhook_events` and ignored as a lower-precedence state. |
-| `FS-02D` | Customer's first payment attempt (`Attempt #1`) fails (`INSUFFICIENT_FUNDS`) at `T = 2m`; customer retries with another card (`Attempt #2`) at `T = 3m` while reservation is still valid. | Single-attempt payment model cancels the entire order on Attempt #1 failure, forcing user to lose their Flash Sale item! | `PaymentIntent` (1 per Order) allows multiple `PaymentAttempt` executions while `Order.status == AWAITING_PAYMENT` and `now < order.expires_at`. |
+| `FS-02A` | Out-of-Order Webhook: `payment.captured` arrives at `T = 100ms`, followed by `payment.authorized` at `T = 250ms`. | Works by coincidence. | `INITIATED -> CAPTURED` is in `AllowedTransitions` (records both `authorized_at = COALESCE(authorized_at, event_time)` and `captured_at = event_time`). When `payment.authorized` arrives while state is `CAPTURED`, `(CAPTURED, ON_WEBHOOK_AUTHORIZED)` is explicitly mapped to **`NOOP_RECORD_TIMESTAMP_ONLY`** (`authorized_at` updated, state stays `CAPTURED`, no duplicate Outbox event). |
+| `FS-02B` | Branch Conflict: Payment is `VOIDED` (because order expired), and then a gateway bug delivers `payment.captured`! | Scalar rank `CAPTURED(30) < VOIDED(90)` would silently ignore the capture, leaving the customer charged! | `(VOIDED, ON_WEBHOOK_CAPTURED)` is explicitly mapped to **`ANOMALY_LATE_CAPTURE_AFTER_VOID`**, transitioning to `REFUND_INITIATED` and emitting `RefundPaymentCommand` + Ops Alert! |
+| `FS-02C` | Duplicate Webhook: Gateway sends `payment.captured` (`webhook_id = W1`) and later resends the same capture (`webhook_id = W2` or `W1`). | Could emit duplicate `PaymentCaptured` events if only `webhook_id` is checked. | `(CAPTURED, ON_WEBHOOK_CAPTURED)` is an **idempotent self-loop (`NOOP_ALREADY_IN_STATE`)**; `captured_at` is already set, so zero duplicate `PaymentCaptured` Outbox events are emitted. |
 
 ### 3. Invariants That Must Always Hold
-- **`INV-ORD-PAY-01 (Strict Separation of Concerns)`**: `Order` state reflects **commercial fulfillment & inventory commitment**; `PaymentIntent` / `PaymentAttempt` state reflects **financial money movement**. Neither state machine overwrites the other directly.
-- **`INV-ORD-PAY-02 (Terminal Fulfillment Immutability)`**: Once an `Order` enters `EXPIRED`, `CANCELLED`, or `REJECTED` (causing its `StockReservation` to be released), it can **NEVER** transition to `CONFIRMED` or `FULFILLED` under any circumstance.
-- **`INV-ORD-PAY-03 (Zero Unrefunded Captures on Non-Confirmed Orders)`**: Every `PaymentAttempt` that reaches `CAPTURED` for an `Order` in `EXPIRED` or `CANCELLED` state MUST deterministically produce a `Refund` (`REFUND_PENDING -> REFUNDED`), verified by both event-driven Saga compensation and a periodic Reconciliation query.
-- **`INV-ORD-PAY-04 (At-Most-One Active Capture per Order)`**: If two payment attempts somehow both succeed (`CAPTURED`) for the same `Order`, the second `CAPTURED` attempt is automatically refunded.
+- **`INV-ORD-PAY-01 (Orthogonal State Ownership)`**: `Order` (`order_db`) owns commercial fulfillment & stock reservation life; `PaymentIntent` / `PaymentAttempt` (`payment_db`) owns financial life.
+- **`INV-ORD-PAY-02 (Terminal Order Fulfillment Lockout)`**: An `Order` in `EXPIRED`, `CANCELLED`, or `REJECTED` state can **NEVER** transition to `CONFIRMED` or `FULFILLED`.
+- **`INV-ORD-PAY-03 (Mutual Exclusion of `VOIDED` and `CAPTURED`)`**: In normal operation, an `AUTHORIZED` `PaymentAttempt` transitions to **either** `CAPTURED` **or** `VOIDED`. If an external gateway forces a capture after a void request, the state machine MUST transition to `REFUND_INITIATED` (`zero unrefunded captures on non-confirmed orders`).
+- **`INV-ORD-PAY-04 (Transactional Outbox Atomicity)`**: Every `Order` or `PaymentAttempt` state transition and its corresponding domain event (`PaymentAuthorized`, `PaymentCaptured`, `PaymentVoided`, `PaymentRefunded`) are committed in the **same local PostgreSQL transaction**.
 
-### 4. Proposed Design: Orthogonal Order & Payment State Machines with Monotonic Webhook Resolution
+### 4. Proposed Design: Explicit State Transition Table & Fact Timestamps
 
-#### 4.1 Order State Machine (`order-service` — `order_db`)
+#### 4.1 `PaymentAttempt` Schema & Recorded Facts (`payment_db`)
+Instead of relying on a single status column to remember history, `payment_attempts` records **immutable fact timestamps** alongside the current `status`:
+```sql
+CREATE TABLE payment_attempts (
+    attempt_id          UUID PRIMARY KEY,
+    payment_intent_id   UUID NOT NULL REFERENCES payment_intents(payment_intent_id),
+    order_id            UUID NOT NULL,
+    attempt_number      INTEGER NOT NULL CHECK (attempt_number >= 1),
+    idempotency_key     VARCHAR(128) NOT NULL UNIQUE,
+    amount              NUMERIC(19, 4) NOT NULL CHECK (amount > 0),
+    currency            CHAR(3) NOT NULL DEFAULT 'USD',
+    status              VARCHAR(32) NOT NULL CHECK (status IN (
+                            'INITIATED',
+                            'AUTHORIZED',
+                            'CAPTURE_PENDING',
+                            'CAPTURED',
+                            'VOID_PENDING',
+                            'VOIDED',
+                            'REFUND_PENDING',
+                            'REFUNDED',
+                            'FAILED'
+                        )),
+    gateway_txn_id      VARCHAR(128) NULL,
+    authorized_at       TIMESTAMPTZ NULL,
+    captured_at         TIMESTAMPTZ NULL,
+    voided_at           TIMESTAMPTZ NULL,
+    refunded_at         TIMESTAMPTZ NULL,
+    failed_at           TIMESTAMPTZ NULL,
+    failure_code        VARCHAR(64) NULL,
+    version             BIGINT NOT NULL DEFAULT 0,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
+
+#### 4.2 Explicit `PaymentAttempt` State Machine & Transition Matrix
 
 ```mermaid
 stateDiagram-v2
-    [*] --> PENDING_RESERVATION : CreateStandardOrder
-    [*] --> FLASH_SALE_QUEUED : FlashSaleSlotClaimed
-    FLASH_SALE_QUEUED --> AWAITING_PAYMENT : StockReserved
-    PENDING_RESERVATION --> AWAITING_PAYMENT : StockReserved (+ CouponLocked)
-    PENDING_RESERVATION --> REJECTED : StockReservationRejected / CouponRejected
+    [*] --> INITIATED : CreatePaymentAttempt
 
-    AWAITING_PAYMENT --> CONFIRMED : PaymentCaptured (while Order == AWAITING_PAYMENT)
-    AWAITING_PAYMENT --> CANCELLED : CustomerCancelCommand (locks Order row first)
-    AWAITING_PAYMENT --> EXPIRED : ReservationExpirySweep (locks Order row first)
+    INITIATED --> AUTHORIZED : Webhook(payment.authorized)
+    INITIATED --> CAPTURED : Webhook(payment.captured) [Direct Capture or Out-of-Order]
+    INITIATED --> FAILED : Webhook(payment.failed) / Timeout
+    INITIATED --> VOIDED : Command(CancelUnpaidAttempt)
 
-    CONFIRMED --> FULFILLED : ShipmentCompleted
-    CONFIRMED --> CANCELLED_REFUNDING : PostConfirmationCancel
-    CANCELLED_REFUNDING --> CANCELLED_REFUNDED : PaymentRefundCompleted
+    AUTHORIZED --> CAPTURE_PENDING : Command(CapturePayment) [Order is AWAITING_PAYMENT]
+    AUTHORIZED --> CAPTURED : Webhook(payment.captured)
+    AUTHORIZED --> VOID_PENDING : Command(VoidPayment) [Order EXPIRED/CANCELLED]
+    AUTHORIZED --> FAILED : Webhook(payment.auth_expired)
 
-    EXPIRED --> EXPIRED_REFUNDING : Late PaymentCaptured arrives after EXPIRED
-    EXPIRED_REFUNDING --> EXPIRED_REFUNDED : PaymentRefundCompleted
+    CAPTURE_PENDING --> CAPTURED : Webhook(payment.captured)
+    CAPTURE_PENDING --> FAILED : Webhook(payment.capture_failed)
 
-    CANCELLED --> CANCELLED_REFUNDING : Late PaymentCaptured arrives after CANCELLED
+    VOID_PENDING --> VOIDED : Webhook(payment.voided)
+    VOID_PENDING --> REFUND_PENDING : Webhook(payment.captured) [Late Capture beat Void at Gateway -> Auto-Refund!]
+
+    VOIDED --> REFUND_PENDING : Webhook(payment.captured) [Anomaly: Gateway captured despite Void -> Auto-Refund!]
+
+    CAPTURED --> CAPTURED : Webhook(payment.authorized) [Out-of-Order Auth -> Record authorized_at only, NOOP]
+    CAPTURED --> REFUND_PENDING : Command(RefundPayment) [Order EXPIRED/CANCELLED or User Refund]
+    REFUND_PENDING --> REFUNDED : Webhook(payment.refunded)
 ```
 
-#### 4.2 Payment State Machine (`payment-service` — `payment_db`)
-We model a `PaymentIntent` aggregate (`1:1` with `order_id`) containing `1..N` `PaymentAttempt` entities (`attempt_id`):
-- **Two Modes Supported**:
-  1. **Auth + Capture (`Two-Step` — Recommended for Flash Sale / High-Contention Orders)**: Gateway `AUTHORIZES` funds on customer's card → `Payment Service` emits `PaymentAuthorized` → `Order Service` verifies `Order` is still `AWAITING_PAYMENT` (locking the order from expiring) and emits `CapturePaymentCommand` → `Payment Service` captures funds (`CAPTURED`) → `Order` transitions to `CONFIRMED`. If the `Order` had already `EXPIRED` when `PaymentAuthorized` arrived, `Order Service` emits `VoidPaymentCommand` (`AUTHORIZED -> VOIDED`), releasing the card hold with zero settlement fee!
-  2. **Direct Capture / Async Webhook (`One-Step` — e.g., QR / E-Wallet / Instant Transfer)**: Gateway sends `PaymentCaptured` directly. If `Order` is `AWAITING_PAYMENT`, `Order -> CONFIRMED`. If `Order` is already `EXPIRED` or `CANCELLED`, `Order -> EXPIRED_REFUNDING` and emits `RefundPaymentCommand` (`CAPTURED -> REFUND_INITIATED -> REFUNDED`).
+| Current `PaymentAttempt.status` | Incoming Event / Command | Next `status` | Fact Timestamp Updated | Outbox Event Emitted (Same DB TX) |
+| :--- | :--- | :--- | :--- | :--- |
+| `INITIATED` | `Webhook: payment.authorized` | `AUTHORIZED` | `authorized_at = ts` | `PaymentAuthorized` |
+| `INITIATED` | `Webhook: payment.captured` *(Direct or Out-of-Order)* | `CAPTURED` | `authorized_at = COALESCE(authorized_at, ts)`, `captured_at = ts` | `PaymentCaptured` |
+| `CAPTURED` | `Webhook: payment.authorized` *(Late Out-of-Order Auth)* | `CAPTURED` *(No change)* | `authorized_at = COALESCE(authorized_at, ts)` | **None** (`NOOP_OUT_OF_ORDER_AUTH_RECORDED`) |
+| `AUTHORIZED` | `Command: CapturePayment` *(from Order Saga)* | `CAPTURE_PENDING` | — | Gateway API call / Simulator trigger |
+| `AUTHORIZED` | `Command: VoidPayment` *(Order Expired/Cancelled)* | `VOID_PENDING` | — | Gateway Void call / Simulator trigger |
+| `VOID_PENDING` or `VOIDED` | `Webhook: payment.captured` *(Gateway Race Anomaly)* | `REFUND_PENDING` | `captured_at = ts` | `PaymentCapturedOnVoidedAttempt` → Triggers immediate `Refund` |
+| `CAPTURED` | `Command: RefundPayment` *(Late capture on expired order)* | `REFUND_PENDING` | — | Gateway Refund call / Simulator trigger |
+| `REFUND_PENDING` | `Webhook: payment.refunded` | `REFUNDED` | `refunded_at = ts` | `PaymentRefunded` |
+| *Any State $S$* | *Duplicate Webhook for already-recorded fact* | $S$ *(No change)* | None | **None** (`NOOP_IDEMPOTENT`) |
 
-```mermaid
-stateDiagram-v2
-    [*] --> INITIATED : PaymentRequested
-    INITIATED --> AUTHORIZED : webhook: payment.authorized (Rank 20)
-    INITIATED --> CAPTURED : webhook: payment.captured (Rank 30 - Direct or Out-of-Order)
-    INITIATED --> FAILED : Attempt failed (Customer may retry new Attempt while Order active)
-    INITIATED --> CANCELLED_UNPAID : OrderExpired / OrderCancelled (No funds held)
+#### 4.3 Explicit `Order` State Machine (`order-service`)
 
-    AUTHORIZED --> CAPTURED : CapturePaymentCommand (from Order Service)
-    AUTHORIZED --> VOID_INITIATED : VoidPaymentCommand (Order expired/cancelled before capture)
-    VOID_INITIATED --> VOIDED : Gateway void confirmed (Rank 90)
+| Current `Order.status` | Incoming Event / Command | Next `Order.status` | Action & Outbox Event Emitted (Same DB TX) |
+| :--- | :--- | :--- | :--- |
+| `AWAITING_PAYMENT` | `PaymentAuthorized` | `PAYMENT_AUTHORIZED` | Locks order against expiry sweep; emits `CapturePaymentCommand` to Payment Service. |
+| `AWAITING_PAYMENT` or `PAYMENT_AUTHORIZED` | `PaymentCaptured` | `CONFIRMED` | Emits `OrderConfirmed` (commits `StockReservation` in Inventory Service). |
+| `AWAITING_PAYMENT` | `OrderExpirySweep` or `CustomerCancel` | `EXPIRED` or `CANCELLED` | Emits `OrderExpired` / `OrderCancelled` (releases `StockReservation` & voids any initiated payment). |
+| `EXPIRED` or `CANCELLED` | `PaymentAuthorized` *(Late Auth)* | `EXPIRED` / `CANCELLED` *(Unchanged)* | Emits **`VoidPaymentCommand`** (`Order` never resurrects!). |
+| `EXPIRED` or `CANCELLED` | `PaymentCaptured` *(Late Capture)* | `EXPIRED_REFUNDING` / `CANCELLED_REFUNDING` | Emits **`RefundPaymentCommand`** (`Order` never resurrects; customer refunded!). |
+| `EXPIRED_REFUNDING` / `CANCELLED_REFUNDING` | `PaymentRefunded` | `EXPIRED_REFUNDED` / `CANCELLED_REFUNDED` | Terminal reconciled state. |
 
-    CAPTURED --> REFUND_INITIATED : RefundPaymentCommand (Late payment on expired order or user refund)
-    REFUND_INITIATED --> REFUNDED : Gateway refund confirmed (Rank 100)
-```
-
-#### 4.3 Handling Duplicate & Out-of-Order Webhooks
-Every incoming webhook in `Payment Service`:
-1. Verifies the `HMAC-SHA256` signature and inserts `webhook_event_id` into `payment_webhook_logs (webhook_event_id PRIMARY KEY)`. Duplicate webhook deliveries hit the PK constraint and return `200 OK` immediately.
-2. Uses **Monotonic State Precedence Ranks** (`INITIATED = 10`, `AUTHORIZED = 20`, `CAPTURED = 30`, `VOID_INITIATED = 80`, `VOIDED = 90`, `REFUND_INITIATED = 95`, `REFUNDED = 100`):
-   - If `payment.captured` (`Rank 30`) arrives *before* `payment.authorized` (`Rank 20`), the attempt transitions `INITIATED (10) -> CAPTURED (30)` and emits `PaymentCaptured` in the local Outbox transaction.
-   - When the delayed `payment.authorized` (`Rank 20`) webhook arrives 200ms later, `20 < currentRank(30)`, so its payload is logged in `payment_webhook_logs` for audit and **no state regression or duplicate event occurs**.
-
-### 5. Alternatives Evaluated
-- **Alternative 1 (2-Second Clock Buffer)**: Rejected because clock buffers fail whenever network or webhook latency exceeds 2 seconds.
-- **Alternative 2 (Distributed Lock across `order_db` and `payment_db`)**: Rejected because external payment webhooks are asynchronous and outside our lock boundary anyway.
-
-### 6. Trade-offs
-- Supporting both `AUTHORIZE -> CAPTURE / VOID` and `DIRECT CAPTURE -> REFUND` adds two states (`AUTHORIZED`, `VOIDED`) to `PaymentAttempt`, but accurately mirrors real Stripe/Adyen payment engineering and eliminates unnecessary refund fees when an order expires during authorization.
-
-### 7. Recovery Strategy
-- **Scheduled Payment-Order Reconciliation Job (every 5 minutes)**: Queries any `PaymentIntent` in `AUTHORIZED` or `CAPTURED` status for `> 5 minutes` whose corresponding `Order` in `order-service` is `EXPIRED` or `CANCELLED`, automatically re-triggering `VoidPaymentCommand` or `RefundPaymentCommand` if an event was delayed in DLQ.
-
-### 8. Acceptance Criteria
-1. **Late Capture Webhook Race Test**: Expire an order at `T0` (releasing stock), then deliver a signed `payment.captured` webhook at `T0 + 10ms`. Verify `Order` transitions `EXPIRED -> EXPIRED_REFUNDING -> EXPIRED_REFUNDED`, `Payment` transitions `CAPTURED -> REFUND_INITIATED -> REFUNDED`, and `StockItem` quantities remain untouched (`INV-ORD-PAY-02` & `INV-ORD-PAY-03`).
-2. **Out-of-Order Webhook Test**: Deliver `payment.captured` followed 50ms later by `payment.authorized` for the same attempt. Verify final state is `CAPTURED` and `PaymentCaptured` is published to Outbox exactly once.
-3. **Multi-Attempt Retry Test**: Fail `Attempt #1` with `INSUFFICIENT_FUNDS`, then submit `Attempt #2` (`SUCCEED`) before `order.expires_at`. Verify the order succeeds cleanly.
-
-### 9. Remaining Questions for Human Architect
-- **`Q-CH02`**: Do you approve the decoupled `Order` and `Payment` state machines (supporting both `Auth -> Capture/Void` and `Direct Capture -> Auto-Refund on late arrival`) and monotonic webhook rank resolution?
+### 5. Acceptance Criteria (`CH-02`)
+1. **Explicit Transition Enforcement Test**: Verify any transition not present in the transition table throws `IllegalPaymentStateTransitionException` (never using numeric rank comparison).
+2. **Out-of-Order `captured` before `authorized` Test**: Deliver `payment.captured` to an `INITIATED` attempt (`-> CAPTURED`, `PaymentCaptured` emitted once), then deliver `payment.authorized`. Verify status remains `CAPTURED`, `authorized_at` is populated, and zero extra Outbox events are emitted.
+3. **Late Capture vs. Void Race Test**: Transition an `Order` to `EXPIRED` (sending `VoidPaymentCommand`), then simulate the gateway delivering `payment.captured` instead of `payment.voided`. Verify `PaymentAttempt` transitions `VOID_PENDING -> REFUND_PENDING -> REFUNDED` and the customer is automatically refunded (`INV-ORD-PAY-03`).
 
 ---
 
-## `CH-03`: Rigorous Idempotency Protocol (State Machine, External Side Effects & Unknown Outcomes)
+## `CH-03`: Class B Idempotency with Lease Generation Fencing & Unknown-Outcome Reconciliation
 
-- **Status:** `PROPOSED` (`M0.2` Revision — Supersedes `M0.1` Blanket `5xx` Deletion Rule)
-- **Related ADR:** [`ADR-0003`](file:///home/anhltn/projects/distributed-commerce-platform/docs/adr/ADR-0003-transactional-outbox-and-inbox-idempotency.md), [`ADR-0010`](file:///home/anhltn/projects/distributed-commerce-platform/docs/adr/ADR-0010-event-contracts-json-schema-and-kafka-kraft.md)
+- **Status:** `PROPOSED` (`M0.2.1` Final Correction — Adds Lease Generation Fencing & Pre-Retry Reconciliation)
+- **Related ADR:** [`ADR-0003`](file:///home/anhltn/projects/distributed-commerce-platform/docs/adr/ADR-0003-transactional-outbox-and-inbox-idempotency.md)
 
-### 1. Problem
-In `M0.1`, we proposed rolling back/deleting the idempotency record whenever a request failed with a `5xx` error. **That is only safe if the entire request is a single local PostgreSQL transaction (which automatically rolls back the idempotency row on abort), and is DANGEROUS if the request performs any external network side effect (such as calling Redis Lua or an external Payment Gateway) before failing with a `504 Gateway Timeout`!**
-- If Request 1 calls an external gateway or Redis Lua, times out (`504`), and deletes the idempotency record, Request 2 with the same `Idempotency-Key` will generate a brand-new internal command and execute the side effect a **second time**!
+### 1. Problem: Why an Expired Lease Alone Must Never Authorize Another External Side Effect
+In `M0.2`, we introduced a 30-second lease on `STARTED` Class B idempotency records. However, consider what happens if **Worker 1** pauses for 35 seconds (GC pause or slow socket) while executing an external side effect:
+1. At $T = 31\text{s}$, `lease_expires_at` passes.
+2. **Worker 2** (handling a client retry) sees `lease_expires_at < NOW()` and steals the lease.
+3. If Worker 2 immediately fires a second external call **without first reconciling whether Worker 1's external call already took effect**, OR if Worker 1 wakes up at $T = 32\text{s}$ and overwrites `idempotency_records` without checking a **fencing token (`lease_generation`)**, we get **concurrent duplicate execution and corrupted idempotency state**!
 
 ### 2. Failure Scenarios
 
-| ID | Failure Scenario | Naive Failure Outcome | Required Safe Outcome |
+| ID | Failure Scenario | Unfenced Lease Outcome | Fenced + Reconciled Outcome (`M0.2.1`) |
 | :--- | :--- | :--- | :--- |
-| `FS-03A` | Request 1 (`POST /payments/{id}/confirm`, Key `K1`) calls external gateway, socket times out (`504`) while gateway actually captured the charge; server deletes `K1`. | Client retries `K1` → Server treats `K1` as brand-new and charges the customer a second time! | Idempotency record transitions to `RECOVERY_REQUIRED` (retaining the deterministic `attempt_id` bound to `K1`); retry with `K1` resumes/queries the **same** `attempt_id` rather than creating a new charge. |
-| `FS-03B` | Request 1 (`K1`) is currently `PROCESSING` on Pod 1; 5ms later Request 2 (`K1`) arrives on Pod 2. | Both pods execute the mutation concurrently. | Pod 1 acquires the `idempotency_records` row (`INSERT ... ON CONFLICT DO NOTHING`); Pod 2 sees `status = 'PROCESSING'` and `lease_expires_at > NOW()`, returning `409 Conflict (IDEMPOTENCY_IN_PROGRESS, Retry-After: 1)`. |
-| `FS-03C` | Pod 1 crashes (`OOMKilled`) after committing Phase 1 (`status = 'PROCESSING'`) of a multi-step idempotent operation before writing the final response. | `K1` stays stuck in `PROCESSING` forever; client retries get `409` forever. | Each `PROCESSING` record carries a `lease_expires_at` (`NOW() + 30s`). Once `NOW() > lease_expires_at`, a retry steals the lease (`version + 1`) and advances from the saved `recovery_checkpoint`. |
-| `FS-03D` | Client sends `{ "skuId": "A", "qty": 1 }` vs `{ "qty": 1, "skuId": "A" }` (key order difference) vs `{ "skuId": "B", "qty": 1 }` (payload mismatch) with the same `K1`. | Naive raw-string hash rejects equivalent JSON key orderings; missing hash check accepts mutated SKU! | Canonical JSON RFC 8785 (JCS) SHA-256 hash matches reordered keys cleanly, and rejects mutated values with `422 IDEMPOTENCY_PAYLOAD_MISMATCH`. |
+| `FS-03A` | Worker 1 (`lease_generation = 1`) stalls after calling external service; lease expires at $30\text{s}$; Worker 2 steals lease (`lease_generation = 2`); Worker 1 wakes up at $32\text{s}$ and tries to `UPDATE idempotency_records`. | Worker 1 overwrites Worker 2's state! | Worker 1's `UPDATE ... WHERE idempotency_key = :k AND lease_generation = 1` affects **`0` rows** → Worker 1 detects `StaleLeaseFencedException` and aborts immediately! |
+| `FS-03B` | Worker 1 (`lease_generation = 1`) timed out (`504`) after sending external side effect; Worker 2 acquires `lease_generation = 2`. | Worker 2 blindly re-executes the external side effect without checking if Gen 1 succeeded! | Worker 2 enters **`RECONCILING` state first**: it queries downstream state using the deterministic `downstream_operation_id` (`claim_id` or `attempt_id`) bound at record creation. If downstream already succeeded, Worker 2 advances directly to `COMPLETED_SUCCESS` **without** re-executing the side effect! |
 
 ### 3. Invariants That Must Always Hold
-- **`INV-IDEM-01 (1:1 Downstream Token Binding)`**: Any idempotency record that initiates a non-transactional external side effect (Redis Lua script or external HTTP call) MUST persist its deterministic `downstream_operation_id` (`claim_id` or `attempt_id`) **before** invoking the external call, and **MUST NEVER delete** that idempotency record on timeout/network failure.
-- **`INV-IDEM-02 (Payload Immutability)`**: A given `(scope_owner_id, endpoint_id, idempotency_key)` can never be executed with two different canonical request payload hashes (`SHA-256`).
-- **`INV-IDEM-03 (Single Active Executor)`**: At most one worker thread/pod may hold an active execution lease on an idempotency key at any time.
+- **`INV-IDEM-01 (Immutable Downstream Operation ID)`**: `downstream_operation_id` (`UUID`) is generated and committed on the initial `INSERT INTO idempotency_records` (`lease_generation = 1`) and **never changes** across subsequent lease generations (`2, 3, ...`).
+- **`INV-IDEM-02 (Monotonic Lease Generation Fencing)`**: Every state update to `idempotency_records` MUST include `WHERE lease_generation = :expectedGeneration` (and every downstream Redis Lua / internal command carries `lease_generation` or idempotent `downstream_operation_id`). A worker with a stale `lease_generation` can never mutate state.
+- **`INV-IDEM-03 (Reconcile-Before-Retry Rule)`**: Whenever `lease_generation > 1` (meaning a prior attempt timed out into `UNKNOWN_RETRYABLE` or its lease expired), the recovery worker **MUST execute a read/reconcile check against the downstream system for `downstream_operation_id` BEFORE deciding whether to re-invoke the external command**.
+- **`INV-IDEM-04 (Downstream Idempotency Contract)`**: Any external/downstream system called by a Class B operation MUST itself be idempotent on `downstream_operation_id` (e.g., Redis Lua checks `claim_id` in `intents`/`buyers`/`released_claims`; Payment Simulator checks `attempt_id` `UNIQUE` constraint).
 
-### 4. Proposed Design: Two-Class Idempotency Model & State Machine
+### 4. Proposed Design: Fenced & Reconciled Class B Idempotency State Machine
 
-We distinguish two architectural classes of idempotent operations:
+#### 4.1 Schema (`idempotency_records`)
+```sql
+CREATE TABLE idempotency_records (
+    scope_owner_id          VARCHAR(128) NOT NULL,  -- customer_id or client_id
+    endpoint_id             VARCHAR(64)  NOT NULL,  -- e.g. 'POST:/api/v1/flash-sales/claim'
+    idempotency_key         VARCHAR(128) NOT NULL,
+    request_hash            CHAR(64)     NOT NULL,  -- RFC 8785 Canonical JSON SHA-256
+    downstream_operation_id UUID         NOT NULL,  -- Assigned once at Gen 1; NEVER changes
+    status                  VARCHAR(32)  NOT NULL CHECK (status IN (
+                                'STARTED',
+                                'UNKNOWN_RETRYABLE',
+                                'RECONCILING',
+                                'COMPLETED_SUCCESS',
+                                'COMPLETED_TERMINAL_ERROR'
+                            )),
+    lease_generation        BIGINT       NOT NULL DEFAULT 1,
+    lease_owner             VARCHAR(128) NOT NULL,  -- pod/instance UUID
+    lease_expires_at        TIMESTAMPTZ  NOT NULL,
+    http_status_code        INTEGER      NULL,
+    response_payload        JSONB        NULL,
+    last_error_code         VARCHAR(64)  NULL,
+    created_at              TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at              TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    expires_at              TIMESTAMPTZ  NOT NULL,
+    PRIMARY KEY (scope_owner_id, endpoint_id, idempotency_key)
+);
+```
 
-#### Class A: Pure Local-ACID + Outbox Operations (e.g., `POST /api/v1/orders` in `Order Service`)
-- Because creating a standard order writes `orders`, `order_lines`, `order_saga_states`, `outbox_messages`, and `idempotency_records` in **one single local PostgreSQL transaction** with **zero external network calls during the transaction**:
-  - If the transaction commits → `idempotency_records` is committed in `COMPLETED` state with the exact serialized `201 Created` response body.
-  - If the transaction aborts/rolls back (e.g., DB deadlock or constraint violation) → PostgreSQL atomically rolls back the entire transaction (zero external side effects occurred), so a retry safely starts fresh.
-
-#### Class B: Operations with External Side Effects (e.g., `POST /api/v1/flash-sales/{id}/claim` calling Redis Lua, or `Payment` gateway calls)
-- Cannot rely on a single DB transaction rollback. Must follow the **Atomic Phase-Checkpointed Idempotency State Machine**:
+#### 4.2 Fenced Recovery & Reconciliation State Machine (Mermaid)
 
 ```mermaid
 stateDiagram-v2
-    [*] --> STARTED : Step 1: INSERT idempotency_records (status='STARTED', downstream_id=UUID, lease=30s)
-    STARTED --> COMPLETED_SUCCESS : External call + DB state committed (2xx cached)
-    STARTED --> COMPLETED_TERMINAL_ERROR : Deterministic business rejection (400, 409 SOLD_OUT, 422 cached)
-    STARTED --> UNKNOWN_RETRYABLE : Timeout / 5xx after external call started (downstream_id preserved!)
-    UNKNOWN_RETRYABLE --> STARTED : Client retries (or lease expires) -> Re-acquires lease with SAME downstream_id
-    COMPLETED_SUCCESS --> [*] : TTL expires (24h–7d)
-    COMPLETED_TERMINAL_ERROR --> [*] : TTL expires (24h)
+    [*] --> STARTED : Gen 1: INSERT (status='STARTED', lease_gen=1, downstream_id=D1)
+    STARTED --> COMPLETED_SUCCESS : External + DB commit (WHERE lease_gen=1)
+    STARTED --> COMPLETED_TERMINAL_ERROR : Deterministic 4xx/409 Rejection (WHERE lease_gen=1)
+    STARTED --> UNKNOWN_RETRYABLE : Network Timeout / 5xx after external dispatch
+    STARTED --> RECONCILING : Lease expired -> Worker 2 steals lease (status='RECONCILING', lease_gen = lease_gen + 1)
+    UNKNOWN_RETRYABLE --> RECONCILING : Client Retry -> Worker 2 acquires lease (status='RECONCILING', lease_gen = lease_gen + 1)
+
+    state RECONCILING {
+        direction LR
+        QueryDownstream["Query Downstream by downstream_id=D1"] --> FoundCommitted : D1 already succeeded downstream
+        QueryDownstream --> FoundRejected : D1 deterministically rejected downstream
+        QueryDownstream --> NotFoundDownstream : D1 never reached downstream (or idempotent replay safe)
+    }
+
+    FoundCommitted --> COMPLETED_SUCCESS : Materialize missing local DB row + Cache 2xx (NO second external call!)
+    FoundRejected --> COMPLETED_TERMINAL_ERROR : Cache 4xx/409 response (NO second external call!)
+    NotFoundDownstream --> STARTED : Safe to invoke downstream with SAME downstream_id=D1 & current lease_gen
 ```
 
-#### 4.3 Canonical Payload Hashing & Retry Rules
-1. **Canonical Hashing (`RFC 8785` / Sorted-Key Normalized JSON)**:
-   - Parse request body DTO, serialize with lexicographically sorted property names and normalized numbers/whitespace, and compute `SHA-256` (`request_hash`).
-2. **Exact Rules for When Execution Can Safely Restart**:
-   - **Rule 1 (`COMPLETED_SUCCESS` — `200`/`201`/`202`)**: Never re-execute; return cached status code and response JSON immediately (`X-Idempotency-Replayed: true`).
-   - **Rule 2 (`COMPLETED_TERMINAL_ERROR` — `400`, `409 SOLD_OUT`, `422`)**: Business rule or validation deterministically rejected the request; return cached error (or allow new `Idempotency-Key` if client fixes input).
-   - **Rule 3 (`STARTED` with `lease_expires_at > NOW()`)**: Another thread is actively executing this key right now → return `409 Conflict` (`IDEMPOTENCY_REQUEST_IN_PROGRESS`, `Retry-After: 1`).
-   - **Rule 4 (`UNKNOWN_RETRYABLE` or `STARTED` with `lease_expires_at <= NOW()`)**: A previous attempt timed out or crashed mid-flight. The retrying request atomically updates `SET lease_expires_at = NOW() + 30s, version = version + 1 WHERE version = :prevVersion`, reads the **already-assigned `downstream_operation_id`** (`claim_id` or `payment_attempt_id`), and **resumes idempotently using that exact `downstream_operation_id`**!
-3. **Record Retention & Cleanup**:
-   - Retain `idempotency_records` for **`24 hours`** (`7 days` for payment endpoints).
-   - A daily background job deletes expired rows in bounded batches (`DELETE FROM idempotency_records WHERE id IN (SELECT id FROM idempotency_records WHERE expires_at < NOW() LIMIT 1000)`).
+#### 4.3 Concrete Unknown-Outcome Reconciliation Procedures
+1. **For Flash Sale Claim (`Promotion Service` -> Redis Lua)**:
+   - When Worker 2 enters `RECONCILING` (`lease_generation = 2`) for `downstream_operation_id = claim_id`:
+   - Worker 2 runs a read/reconcile check in Redis & PostgreSQL for `claim_id`:
+     - If `claim_id` is already in `promotion_db.flash_sale_claims` (`CLAIMED_RESERVED`) → return cached `202 Accepted`.
+     - If `claim_id` is already in Redis `intents` (meaning Worker 1's Lua call succeeded before Worker 1 crashed!) → Worker 2 **does NOT decrement Redis stock again**; it directly executes Step 2 (`INSERT INTO flash_sale_claims ... ON CONFLICT (claim_id) DO NOTHING`) and transitions to `COMPLETED_SUCCESS`!
+     - If `claim_id` is in `promotion_db` as `ABANDONED_FENCED` → return `409 Conflict (CLAIM_LEASE_EXPIRED_PLEASE_RETRY_NEW_KEY)`.
+     - Only if `claim_id` is absent from both PG and Redis `intents`/`released_claims` does Worker 2 invoke `flash_sale_claim.lua` with `claim_id`.
+2. **For Payment Execution (`Payment Service` -> Payment Simulator / Gateway)**:
+   - Worker 2 (`lease_generation = 2`) queries the Gateway's `GET /simulator/transactions/{downstream_operation_id}` status endpoint first:
+     - If Gateway reports `AUTHORIZED` or `CAPTURED` → update local `PaymentAttempt` and complete without sending a second charge request.
+     - Only if Gateway reports `404 Not Found` does Worker 2 dispatch the `POST` charge request carrying `idempotency_key = downstream_operation_id`.
 
-### 5. Alternatives Evaluated
-- **Alternative 1 (Delete idempotency key on all `5xx` errors — `M0.1` draft)**: Unsafe whenever an external call was already dispatched before the `5xx` occurred.
-- **Alternative 2 (Store idempotency keys only in Redis with TTL)**: If Redis evicts a key or restarts without fsync, payment or order idempotency is lost. Storing `idempotency_records` in the owning service's PostgreSQL database guarantees ACID durability alongside the domain entities.
-
-### 6. Trade-offs
-- Class B operations require `1` lightweight `INSERT/UPDATE` on `idempotency_records` before and after the external side effect, trading `~1–2ms` of local DB latency for complete protection against timeout double-charges and crashed-pod lockouts.
-
-### 7. Acceptance Criteria
-1. **Timeout After External Call Test**: Simulate a socket timeout right after `flash_sale_claim.lua` (or payment gateway charge) succeeds, leaving `idempotency_records` in `UNKNOWN_RETRYABLE`. Retry with the same `Idempotency-Key` and verify it reuses the exact same `claim_id`/`attempt_id` and completes without double-claiming or double-charging (`INV-IDEM-01`).
-2. **Canonical Hash Equivalence & Mismatch Test**: Verify `{"a":1,"b":2}` and `{"b":2,"a":1}` with the same key produce the same `SHA-256` hash and return `200/201` replayed, whereas `{"a":1,"b":3}` with the same key returns `422 IDEMPOTENCY_PAYLOAD_MISMATCH` (`INV-IDEM-02`).
-3. **Concurrent In-Flight Request Test**: Hold Request 1 inside a transaction barrier while sending Request 2 with the same key; verify Request 2 immediately receives `409 IDEMPOTENCY_REQUEST_IN_PROGRESS` (`INV-IDEM-03`).
-
-### 8. Remaining Questions for Human Architect
-- **`Q-CH03`**: Do you approve the Two-Class Idempotency Model (`Class A` single-TX atomic vs. `Class B` checkpointed state machine preserving `downstream_operation_id` across `UNKNOWN_RETRYABLE` states)?
+### 5. Acceptance Criteria (`CH-03`)
+1. **Zombie Lease Fencing Test**: Pause Worker 1 (`lease_generation = 1`) after external dispatch; advance clock past `lease_expires_at`; let Worker 2 acquire `lease_generation = 2` and complete `COMPLETED_SUCCESS`; resume Worker 1 and verify its `UPDATE ... WHERE lease_generation = 1` updates `0` rows and throws `StaleLeaseFencedException` (`INV-IDEM-02`).
+2. **Reconcile-Before-Retry Test**: Simulate a socket timeout right after Redis `flash_sale_claim.lua` succeeds (leaving `claim_id` in Redis `intents` and `idempotency_records` in `UNKNOWN_RETRYABLE`). Retry with the same `Idempotency-Key`; verify Worker 2 transitions through `RECONCILING`, detects `claim_id` already exists in Redis `intents`, persists the PostgreSQL row **without** decrementing Redis stock a second time, and returns `202 Accepted` (`INV-IDEM-03`).
 
 ---
 
-## `CH-04`: Kafka Ordering Guarantees, Aggregate Sequence Versioning, Tombstones & DLQ Replay
+## `CH-04`: Outbox Relay Serialization, Commit-Order Inversion & Consumer Sequence-Gap Handling
 
-- **Status:** `PROPOSED` (`M0.2` Revision)
+- **Status:** `PROPOSED` (`M0.2.1` Final Correction — Solves Multi-Worker Relay Races & DB Sequence vs Commit Order)
 - **Related ADRs:** [`ADR-0003`](file:///home/anhltn/projects/distributed-commerce-platform/docs/adr/ADR-0003-transactional-outbox-and-inbox-idempotency.md), [`ADR-0010`](file:///home/anhltn/projects/distributed-commerce-platform/docs/adr/ADR-0010-event-contracts-json-schema-and-kafka-kraft.md)
 
-### 1. Problem
-We must explicitly define **when Kafka message ordering IS guaranteed, when it is NOT guaranteed**, and how our consumers remain 100% state-consistent even when events arrive **out of order** (due to non-blocking retry topics, DLQ replays, or partition count changes).
+### 1. Problem: Three Subtle Outbox & Kafka Ordering Hazards
+In `M0.2`, we added `outbox_sequence BIGSERIAL` and `aggregateVersion`. Your `M0.2.1` review pinpointed three deep distributed-systems subtleties that must be solved explicitly:
+1. **Concurrent Outbox Relay Workers Race (`FOR UPDATE SKIP LOCKED` Trap)**:
+   - Suppose `order-service` runs `2` pods (`Pod A` and `Pod B`), each running an Outbox Relay loop with `SELECT ... WHERE processed_at IS NULL ORDER BY outbox_sequence ASC LIMIT 100 FOR UPDATE SKIP LOCKED`.
+   - If `Order O1` has two uncommitted/unprocessed outbox events: `E1 (aggregateVersion = 1)` and `E2 (aggregateVersion = 2)`:
+     - If `Pod A` locks `E1` while `Pod B` skips locked `E1` and locks `E2`, and `Pod B` finishes its Kafka `send()` `5ms` faster than `Pod A`, **`E2 (v=2)` is published to the Kafka partition BEFORE `E1 (v=1)`**!
+2. **PostgreSQL `BIGSERIAL` Allocation Order $\neq$ Transaction Commit Visibility Order**:
+   - Transaction `TX_1` allocates `outbox_sequence = 100` at $T = 0\text{ms}$ and commits at $T = 50\text{ms}$.
+   - Transaction `TX_2` allocates `outbox_sequence = 101` at $T = 5\text{ms}$ and commits at $T = 10\text{ms}$.
+   - Note that for events belonging to the **same aggregate (`order_id = O1`)**, the aggregate row lock (`@Version` / `FOR NO KEY UPDATE` on `orders WHERE order_id = O1`) strictly serializes `TX_1` ($v=1$) and `TX_2` ($v=2$) so `TX_2` cannot even begin mutating `O1` until `TX_1` has committed! Thus, **within a single aggregate (`aggregate_id`)**, `aggregate_version` (`1, 2, 3...`) AND `outbox_sequence` are strictly monotonic in commit order. Across *different* aggregates (`O1` vs `O2`), `TX_2` (`seq 101`) can become visible before `TX_1` (`seq 100`)—which is why our poller uses `WHERE processed_at IS NULL` (never advancing a high-watermark cursor that skips late-committing `seq 100`!).
+3. **Missing / Future Aggregate Versions at the Consumer (`incoming.aggregateVersion > last_applied_version + 1`)**:
+   - In `M0.2`, we handled stale events (`incoming <= last_applied`) and Cancel-before-Create tombstones. What if an aggregate has `3` sequential state updates ($v=1 \to v=2 \to v=3$), and $v=2$ is shunted to `.retry.1m` while $v=3$ arrives on the main topic? Now `incoming (3) > last_applied (1) + 1` ($v=2$ is **missing/in-flight**)!
 
-### 2. When Ordering IS vs. IS NOT Guaranteed in Our Architecture
+### 2. Failure Scenarios
 
-| Scenario | Is Strict Causal Ordering Guaranteed by Kafka Alone? | Why? |
-| :--- | :--- | :--- |
-| **Events for the same `aggregateId` (`orderId`) on the main topic (`enable.idempotence=true`, `max.in.flight.requests.per.connection <= 5`, fixed partition count)** | **YES** | Outbox Relay polls in `ORDER BY created_at ASC, outbox_seq ASC` and publishes with `partition_key = orderId`, landing all events for `orderId` on the exact same partition in causal order. |
-| **Events across TWO DIFFERENT topics (e.g., `commerce.order.events.v1` vs `commerce.payment.events.v1`)** | **NO** | Consumers poll multiple topics/partitions at independent speeds; there is zero cross-topic ordering guarantee in Kafka. |
-| **When Event $E_1$ is shunted to a Non-Blocking Retry Topic (`.retry.1m`) or `.dlq.v1` while Event $E_2$ for the same `orderId` arrives on the main topic** | **NO (Order Inversion Occurs)** | $E_2$ (`OrderCancelled`) is consumed immediately from the main topic at `T = 1s`, whereas $E_1$ (`OrderCreated`) is re-consumed from `.retry.1m` at `T = 60s` (`E_2` processed before `E_1`!). |
-| **When an Operator Replays Messages from `.dlq.v1` hours later** | **NO** | The aggregate may have already advanced 3 states forward (`EXPIRED`, `CANCELLED`, or `REFUNDED`) since the DLQ event failed. |
-
-### 3. Failure Scenarios
-
-| ID | Failure Scenario | Naive Failure Outcome | Required Safe Outcome |
+| ID | Failure Scenario | Naive Failure Outcome | `M0.2.1` Safe Outcome |
 | :--- | :--- | :--- | :--- |
-| `FS-04A` | `OrderCreated` ($v=1$) is shunted to `.retry.1m`; `OrderCancelled` ($v=2$) processes on main topic; 1m later `OrderCreated` ($v=1$) replays from `.retry.1m`. | Consumer processes `OrderCreated` ($v=1$) after cancellation and reserves stock for a dead order! | `OrderCancelled` ($v=2$) writes a `CANCELLED_TOMBSTONE` (`last_applied_aggregate_version = 2`) in `Inventory Service`; when $v=1$ arrives later, `1 < 2` (and status is terminal tombstone), so it is logged as `STALE_EVENT_SKIPPED` and acknowledged without reserving stock. |
-| `FS-04B` | `ProductUpdated` ($v=5$, price `$999`) arrives after `ProductUpdated` ($v=6$, price `$899`) due to retry/replay. | Search read-model overwrites `$899` with stale price `$999`! | Read-model `UPDATE ... WHERE last_source_version < :incomingAggregateVersion` ignores $v=5$ because $5 < 6$. |
-| `FS-04C` | Admin clicks "Replay DLQ Message" for an event that is now stale or already resolved. | Blind DLQ replay corrupts current aggregate state. | DLQ Replay goes through the exact same `Inbox` + `aggregateVersion` + monotonic state machine checks as live traffic. |
+| `FS-04A` | Two Outbox Relay pods concurrently poll `outbox_messages` using naive row-level `SKIP LOCKED`; Pod 1 grabs `(O1, v=1)` and Pod 2 grabs `(O1, v=2)`. | Pod 2 publishes `v=2` to Kafka before Pod 1 publishes `v=1` → **Producer-side order inversion!** | Outbox Relay enforces **Per-Aggregate Serialization** (partitioning poll work by `hashtext(aggregate_id)` advisory lock or ensuring a batch only claims `aggregate_id`s where no earlier unprocessed row exists). |
+| `FS-04B` | Kafka Producer sends batch 1 (`v=1`) and batch 2 (`v=2`) over TCP; batch 1 fails transiently and retries without idempotent sequence numbers. | Batch 2 lands in Kafka log before retried Batch 1. | Producer enforces `acks=all`, `enable.idempotence=true`, `max.in.flight.requests.per.connection=5` (Kafka broker strictly validates monotonic producer sequence numbers per partition and rejects out-of-order batches). |
+| `FS-04C` | Sequence Gap at Consumer: $v=1$ is applied (`last_applied_version = 1`), $v=2$ fails transiently into `.retry.1m`, and $v=3$ arrives on the main topic (`3 > 1 + 1`). | Applying $v=3$ when $v=2$ was skipped leaves missing state transitions or fails precondition checks. | Consumer detects **Sequence Gap (`incoming.aggregateVersion > last_applied_version + 1`)**; unless $v=3$ is a self-contained terminal cancellation/snapshot, $v=3$ throws `RetryableOutboxSequenceGapException` and routes to `.retry.1m` so $v=2$ executes first! |
 
-### 4. Invariants That Must Always Hold
-- **`INV-ORD-KFK-01 (Monotonic Aggregate Version Guard)`**: Every event envelope MUST carry `aggregateVersion: long` (the monotonic `@Version` of the producing aggregate at the moment the event was emitted into `outbox_messages`). No state-projection or consumer may regress an aggregate's tracked `last_applied_version` (`incoming.aggregateVersion <= tracked.last_applied_version` for state overwrites is rejected as stale).
-- **`INV-ORD-KFK-02 (Tombstone Precedence)`**: A cancellation/expiration event arriving before its corresponding creation/reservation event MUST create a durable **Terminal Tombstone Row** (`status = 'CANCELLED_TOMBSTONE'`) so the late creation event cannot resurrect the workflow.
+### 3. Invariants That Must Always Hold
+- **`INV-ORD-KFK-01 (Per-Aggregate Outbox Publication Serialization)`**: Across all running instances of a service's Outbox Relay, at most **one** worker may publish unprocessed outbox messages for a given `aggregate_id` at any time, and messages for that `aggregate_id` MUST be published in strict `aggregate_version ASC, outbox_sequence ASC` order.
+- **`INV-ORD-KFK-02 (Database Visibility Independence)`**: The Outbox Relay tracks completion per row (`processed_at IS NOT NULL`) rather than a global `last_published_sequence` watermark, guaranteeing that a slower transaction with `outbox_sequence = 100` committing after `outbox_sequence = 101` is never skipped.
+- **`INV-ORD-KFK-03 (Consumer Version Continuity & Gap Detection)`**: For any stateful consumer tracking `last_applied_version` per `aggregate_id`:
+  1. If `incoming.aggregateVersion <= last_applied_version`: **Stale / Duplicate** → Acknowledge & ignore (`NOOP`).
+  2. If `incoming.aggregateVersion == last_applied_version + 1`: **In-Order Next Step** → Apply transition & set `last_applied_version = incoming.aggregateVersion`.
+  3. If `incoming.aggregateVersion > last_applied_version + 1`:
+     - If incoming event is a **Terminal Cancellation / Expiry (`OrderCancelled`, `OrderExpired`)** and `last_applied_version == 0` (no reservation created yet): Apply **Terminal Tombstone** (`source_order_version = incoming.aggregateVersion`).
+     - If incoming event is a **Full-State Idempotent Snapshot** (e.g., `ProductCatalogSnapshot` carrying the complete current document): Apply snapshot & set `last_applied_version = incoming.aggregateVersion`.
+     - If incoming event is a **Delta / State-Machine Step requiring prior steps**: Reject as **`SEQUENCE_GAP_DETECTED`** (do NOT insert into `inbox_messages`) and route to `.retry.1m` so the missing prior version ($v = \text{last\_applied} + 1$) is processed first!
 
-### 5. Proposed Design: Sequence-Versioned Envelope + Tombstone Guards + Safe DLQ Replay
+### 4. Proposed Design: Partitioned Outbox Relay & Consumer Version Gate
 
-#### 5.1 Updated Event Envelope (`aggregateVersion` Mandatory)
-We add `"aggregateVersion"` (`integer >= 1`) to [`docs/event-contracts/event-envelope.v1.schema.json`](file:///home/anhltn/projects/distributed-commerce-platform/docs/event-contracts/event-envelope.v1.schema.json) alongside a monotonic `outbox_sequence BIGSERIAL` column on `outbox_messages`:
-```json
-{
-  "eventId": "019316a8-7c4b-7000-8a12-3f9c8d7e6b5a",
-  "eventType": "commerce.order.cancelled.v1",
-  "eventVersion": 1,
-  "source": "order-service",
-  "aggregateType": "Order",
-  "aggregateId": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
-  "aggregateVersion": 2,
-  "occurredAt": "2026-11-10T16:35:00.123Z",
-  "correlationId": "4bf92f3577b34da6a3ce929d0e0e4736",
-  "causationId": "019316a8-7000-7000-8000-111122223333",
-  "payload": { ... }
-}
+#### 4.1 Per-Aggregate Serialized Outbox Query (Preventing Multi-Worker Inversion)
+To prevent two relay pods from concurrently grabbing `(O1, v=1)` and `(O1, v=2)`, our Outbox Relay uses **Aggregate-Head Locking** (or bucket assignment via `pg_try_advisory_xact_lock`):
+```sql
+-- Each Relay Worker claims a batch of distinct aggregate_ids by locking the OLDEST
+-- unprocessed outbox row per aggregate_id, then fetches all unprocessed rows for those aggregates
+-- in strict (aggregate_version ASC, outbox_sequence ASC) order:
+WITH locked_heads AS (
+    SELECT outbox_sequence, aggregate_id
+    FROM outbox_messages o1
+    WHERE o1.processed_at IS NULL
+      AND NOT EXISTS (
+          SELECT 1 FROM outbox_messages o2
+          WHERE o2.aggregate_id = o1.aggregate_id
+            AND o2.processed_at IS NULL
+            AND o2.outbox_sequence < o1.outbox_sequence
+      )
+    ORDER BY o1.outbox_sequence ASC
+    LIMIT 50
+    FOR UPDATE SKIP LOCKED
+)
+SELECT m.*
+FROM outbox_messages m
+JOIN locked_heads lh ON m.aggregate_id = lh.aggregate_id
+WHERE m.processed_at IS NULL
+ORDER BY m.aggregate_id, m.aggregate_version ASC, m.outbox_sequence ASC
+FOR UPDATE OF m;
 ```
+- **Why This Guarantees Strict Per-Aggregate Serialization**:
+  1. If `Order O1` has unprocessed events `v=1 (seq 10)` and `v=2 (seq 15)`, only `v=1 (seq 10)` satisfies the `NOT EXISTS (... earlier unprocessed row ...)` head predicate!
+  2. When **Pod A** locks `v=1 (seq 10)` in `locked_heads`, it then locks and publishes `[v=1, v=2]` sequentially for `O1` in one batch.
+  3. If **Pod B** polls concurrently, `v=1 (seq 10)` is locked by Pod A (`SKIP LOCKED`), and `v=2 (seq 15)` is excluded by `NOT EXISTS` because `v=1` is still `processed_at IS NULL`! Therefore, **Pod B can NEVER leapfrog Pod A on the same `aggregate_id`**!
+  4. Furthermore, within the batch for `O1`, if publishing `v=1` to Kafka fails, the relay worker stops processing subsequent events (`v=2`) for `O1` in that cycle so `v=2` is never sent before `v=1`.
 
-#### 5.2 Out-of-Order & Tombstone Resolution Flow (Mermaid)
+#### 4.2 Database Ordering vs. Kafka Partition Ordering Comparison
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Main as Kafka Main Topic
-    participant Retry as Kafka .retry.1m Topic
-    participant INV as Inventory Service Consumer
-    participant DB as inventory_db (stock_reservations)
+| Dimension | PostgreSQL `outbox_messages` Ordering | Apache Kafka Partition Ordering |
+| :--- | :--- | :--- |
+| **Ordering Key** | `(aggregate_id, aggregate_version ASC, outbox_sequence ASC)` | `ProducerRecord.key = aggregate_id` (`murmur2(key) % numPartitions`) |
+| **Cross-Transaction Visibility** | `BIGSERIAL` allocates numbers at `INSERT` time, not `COMMIT` time; solved by `WHERE processed_at IS NULL` per-row tracking rather than sequence watermark cursors. | Broker appends records in the exact order producer batches arrive on the partition leader. |
+| **In-Flight Network Reordering Protection** | Head-of-aggregate `FOR UPDATE SKIP LOCKED` query prevents 2 relay pods from sending `v=2` before `v=1`. | `enable.idempotence=true` + `acks=all` + `max.in.flight.requests.per.connection <= 5` assigns monotonic `(ProducerId, SequenceNumber)` per batch. |
+| **Consumer-Side Reordering Recovery** | N/A | Enforced via `aggregateVersion` continuity check (`<`: stale no-op, `== +1`: apply, `> +1`: tombstone or retry gap). |
 
-    Main->>INV: Deliver OrderCreated (orderId=O1, aggregateVersion=1)
-    Note over INV,DB: Transient DB timeout! 3 fast in-place retries fail.
-    INV->>Retry: Publish OrderCreated (v=1) to .retry.1m
-
-    Main->>INV: Deliver OrderCancelled (orderId=O1, aggregateVersion=2)
-    INV->>DB: SELECT reservation WHERE order_id = O1 (None found!)
-    Note over INV,DB: Insert Tombstone: StockReservation(order_id=O1, status='RELEASED', qty=0, source_order_version=2)
-    INV-->>Main: Commit Offset (OrderCancelled processed)
-
-    Note over Retry,INV: 60 seconds later...
-    Retry->>INV: Redeliver OrderCreated (orderId=O1, aggregateVersion=1)
-    INV->>DB: Check existing StockReservation for order_id=O1
-    Note over INV,DB: Finds Tombstone (status='RELEASED', source_order_version=2 >= incoming v=1)!
-    Note over INV: Log STALE_OUT_OF_ORDER_EVENT_IGNORED + Record in inbox_messages
-    INV-->>Retry: Acknowledge & Skip (0 stock reserved!)
-```
-
-#### 5.3 Retry Escalation, Retention & DLQ Replay Strategy
-1. **Tier 1 (In-Place Short Backoff)**: `3` attempts (`100ms`, `250ms`, `500ms`) inside the consumer before leaving the main partition (resolves brief lock/network blips while preserving partition order).
-2. **Tier 2 (Non-Blocking Retry Topics)**: `.retry.1m` → `.retry.5m` for transient dependency outages (`DatabaseUnavailableException`, `HttpTimeoutException`). Validation/schema errors (`JsonProcessingException`, `InvalidDomainInvariantException`) bypass retry topics and go straight to `.dlq.v1`.
-3. **DLQ Storage & Controlled Replay**:
-   - DLQ messages are persisted into an `admin_dlq_messages` table (or inspected from `.dlq.v1`) with status `PENDING_REVIEW | REPLAYED | DISCARDED`.
-   - When an `ADMIN_OPS` engineer triggers **Replay**, the message is re-dispatched with header `x-dlq-replayed-by` through the normal consumer pipeline—where **`Inbox` deduplication, `aggregateVersion` staleness checks, and Tombstone guards remain active**, guaranteeing that replaying an old DLQ event can never corrupt a newer aggregate state.
-
-### 6. Alternatives Evaluated
-- **Alternative 1 (Strict Partition-Halting Retry — Pause Partition Until Fixed)**: Guarantees 100% order preservation, but a single bug on 1 order halts checkout for 1/6th of all customers on the platform.
-- **Alternative 2 (Keyed Per-Aggregate Block List in Redis during Retry)**: When `orderId=O1` goes to `.retry.1m`, write `retry_blocked:O1` in Redis so subsequent events for `O1` on the main topic also get routed to `.retry.1m`.
-  - *Trade-off*: Preserves per-aggregate ordering across retry topics, but if Redis is unreachable or a retry takes 5m, a user's `OrderCancelled` event is unnecessarily delayed instead of immediately tombstoning the order. Our **Tombstone + `aggregateVersion` design** handles out-of-order cancellation immediately without waiting!
-
-### 7. Acceptance Criteria
-1. **Out-of-Order Cancel Before Create Test**: Deliver `OrderCancelled (aggregateVersion=2)` to `Inventory Service` *before* `OrderCreated (aggregateVersion=1)`. Verify `OrderCancelled` writes a terminal tombstone row, `OrderCreated` is skipped as stale upon arrival, and `available_qty` is never decremented (`INV-ORD-KFK-01` & `INV-ORD-KFK-02`).
-2. **Stale Read-Model Event Test**: Deliver `ProductUpdated (aggregateVersion=4, price=100)` followed by `ProductUpdated (aggregateVersion=3, price=200)`. Verify search read-model retains `price=100` (`version=4`).
-3. **DLQ Replay Safety Test**: Route a failed event to `.dlq.v1`, advance the order to `CANCELLED`, then replay the DLQ event via the Admin API; verify the consumer safely ignores the stale replay and marks the DLQ record `REPLAYED_NOOP_STALE`.
-
-### 8. Remaining Questions for Human Architect
-- **`Q-CH04`**: Do you approve adding mandatory `aggregateVersion` to the event envelope, the Tombstone pattern (`RELEASED / CANCELLED_TOMBSTONE` on out-of-order cancel), and the 3-tier retry + state-guarded DLQ replay strategy?
+### 5. Acceptance Criteria (`CH-04`)
+1. **Multi-Worker Outbox Serialization Test**: Insert 5 sequential events (`v=1..5`) for `orderId = O1` and 50 events for other orders; run `4` concurrent Outbox Relay worker threads polling simultaneously. Verify `O1`'s events arrive on the Kafka partition in strict `[1, 2, 3, 4, 5]` order (`INV-ORD-KFK-01`).
+2. **Out-of-Order Commit Sequence Test**: Start `TX_1` (allocates `outbox_sequence = 10`), then start and commit `TX_2` (`outbox_sequence = 11`), run the Outbox Relay (publishes `11`), then commit `TX_1` (`10`) and run the Outbox Relay again. Verify `10` is published on the second poll and never skipped (`INV-ORD-KFK-02`).
+3. **Missing Version Gap Test**: Deliver `v=1` (`applied`), skip `v=2`, and deliver delta event `v=3`. Verify consumer detects `3 > 1 + 1`, routes `v=3` to `.retry.1m` without committing it to `inbox_messages`, then processes `v=2` followed by `v=3` cleanly (`INV-ORD-KFK-03`).
 
 ---
 
-## `CH-05`: Standards-Compliant OIDC, Split-Horizon Discovery, Key Rotation & Service Identity
+## `CH-05`: OIDC Identity vs. OAuth2 Authorization (RFC 9068), Claim Normalization & Service Policies
 
-- **Status:** `PROPOSED` (`M0.2` Revision)
+- **Status:** `PROPOSED` (Design Direction Approved — Clarified in `M0.2.1`)
 - **Related ADR:** [`ADR-0006`](file:///home/anhltn/projects/distributed-commerce-platform/docs/adr/ADR-0006-api-gateway-yarp-and-oidc-jwt-security.md)
 
-### 1. Problem
-Per `Q5` (`ACCEPTED`), we must design OIDC cleanly from Day 1 in `customer-service` so that introducing **Keycloak** later requires zero application code rewrites across Java, .NET, and Python services. To achieve true standards compliance without custom auth hacks, we must define:
-1. Public vs. internal OIDC Discovery & JWKS resolution (`iss` validation vs. container-network `jwks_uri` fetching).
-2. Audience (`aud`) validation per resource server vs. API Gateway.
-3. Asymmetric key rotation (`kid`) without downtime.
-4. Machine-to-machine (`M2M`) service identity using standard OAuth2 `grant_type=client_credentials` and fine-grained `scope` claims.
-5. Exact claim mapping compatibility with Keycloak (`roles`, `realm_access.roles`, `scope`, `azp`).
+### 1. Explicit Separation: OIDC Authentication (`id_token`) vs. OAuth2 Authorization (`access_token`)
+To avoid a common industry anti-pattern (passing OIDC `id_token`s to backend microservices or conflating identity claims with API authorization):
 
-### 2. Failure Scenarios
+| Token Type | Standard | Intended Recipient (`aud`) | Purpose | Never Used For |
+| :--- | :--- | :--- | :--- | :--- |
+| **OIDC `id_token`** | OpenID Connect Core 1.0 | **Frontend Client Application ONLY** (`aud: "commerce-web-spa"`) | Proves to the React SPA *who the logged-in human user is* (`name`, `email`, `picture`, `authenticated_at`). | **NEVER sent in `Authorization: Bearer` headers to `api-gateway` or backend microservices!** (`api-gateway` rejects `id_token`s because their `aud` is `"commerce-web-spa"`, not `"commerce-api"`). |
+| **OAuth2 JWT `access_token`** | **RFC 9068** (JWT Profile for OAuth 2.0 Access Tokens) | **API Gateway & Resource Servers** (`aud: ["commerce-api", ...]`) | Authorizes API operations via `sub`, `scope`, `roles`, `client_id` / `azp`. | Never used by the frontend as a profile data store. |
+| **OAuth2 `refresh_token`** | RFC 6749 / RFC 9700 | **OIDC Token Endpoint ONLY** (`POST /api/v1/auth/token`) | Opaque/rotating high-entropy token stored in `HttpOnly; Secure; SameSite=Strict` cookie (or secure storage) with reuse detection in `customer_db`. | Never sent to Resource Servers. |
 
-| ID | Failure Scenario | Naive Failure Outcome | Required Safe Outcome |
-| :--- | :--- | :--- | :--- |
-| `FS-05A` | Browser gets JWT with `iss: "https://auth.commerce.dev-atlas.lab"`; `order-service` pod inside K8s fetches JWKS from `http://customer-service:8080/.well-known/jwks.json`. | Validation fails with `Invalid Issuer` (if `issuer-uri` is set to internal URL) OR `Connection Refused` (if pod tries to resolve external URL without hairpin NAT). | Resource servers validate `iss == AUTH_ISSUER_URI` (`https://auth.commerce.dev-atlas.lab`) while fetching signing keys over `AUTH_JWKS_URI` (`http://customer-service:8080/.well-known/jwks.json`). |
-| `FS-05B` | Signing key is rotated (`kid: "key-2026-11"` → `kid: "key-2026-12"`). | All active 15-minute user tokens signed with `key-2026-11` immediately fail with `401 Unauthorized`! | `/.well-known/jwks.json` publishes **both** the active signing key (`key-2026-12`) and the previous verification-only key (`key-2026-11`) for a grace period $\ge 2 \times \text{MaxTokenTTL}$ (`30m`). |
-| `FS-05C` | Compromised or buggy service token (`client_credentials` for `notification-service`) attempts to call `POST /api/v1/admin/inventory/adjust`. | Flat `"INTERNAL_SERVICE"` role grants god-mode access to all internal endpoints! | M2M tokens carry explicit `azp` (`client_id`) and least-privilege OAuth2 `scope` claims (e.g., `inventory:read`, `flashsale:warm`), enforced at the target endpoint. |
+### 2. RFC 9068 Access Token Validation & Keycloak Claim Normalization Contract
+Every Resource Server (`Java Spring Security`, `.NET JwtBearer`, `Python FastAPI`) executes a standardized **5-Step Token Validation & Claim Normalization Pipeline**:
+1. **Step 1 — JWS Signature & Algorithm Check**: Verify `alg == "RS256"` (reject `alg: "none"` or symmetric `HS256`) and validate signature against the public key in `AUTH_JWKS_URI` matching header `kid` (with `ACTIVE_SIGNER` + `VERIFY_ONLY` key rotation cache).
+2. **Step 2 — Token Type Header (`typ`) Check**: Accept `typ` in `["at+jwt", "JWT"]` (RFC 9068 `application/at+jwt` and Keycloak default `JWT`).
+3. **Step 3 — Issuer (`iss`) & Timestamps (`exp`, `nbf`, `iat`)**: Exact match `iss == AUTH_ISSUER_URI` (`https://auth.commerce.dev-atlas.lab`) with max `30s` clock skew.
+4. **Step 4 — Audience (`aud`) Enforcement**:
+   - External user endpoints via Gateway require `"commerce-api" \in aud`.
+   - Internal M2M endpoints additionally verify that the target service name (e.g., `"inventory-service"`) or `"commerce-api"` is present in `aud`.
+5. **Step 5 — Deterministic Claim Normalization (Zero-Code-Change Keycloak Compatibility)**:
+   - **Caller Client ID**: Normalized as `resolved_client_id = coalesce(jwt.client_id, jwt.azp)` (RFC 9068 uses `client_id`; Keycloak places the client identifier in `azp` and sets `client_id` on M2M tokens).
+   - **Granted Scopes (`SCOPE_*`)**: Parsed from space-delimited `jwt.scope` string (`"openid orders:write flashsale:claim"`).
+   - **Granted Roles (`ROLE_*`)**: Union of:
+     - `jwt.roles[]` (top-level array emitted by `customer-service` and configurable Keycloak protocol mapper),
+     - `jwt.realm_access.roles[]` (Keycloak default realm roles), and
+     - `jwt.resource_access["commerce-api"].roles[]` (Keycloak client roles).
 
-### 3. Invariants That Must Always Hold
-- **`INV-OIDC-01 (Strict Issuer + Audience + Signature Verification)`**: Every Resource Server MUST verify:
-  1. Cryptographic signature (`RS256`) against the JWK matching the JWT header's `kid`.
-  2. `iss` claim exact match against `AUTH_ISSUER_URI`.
-  3. `aud` claim contains `"commerce-api"` (or the specific target service identifier).
-  4. `exp` and `nbf` timestamps (with maximum `30s` clock-skew tolerance).
-- **`INV-OIDC-02 (Zero-Downtime Key Rotation)`**: Whenever a new RSA key pair (`kid_new`) is promoted to active signer, `kid_old` MUST remain published in `/.well-known/jwks.json` for verification until all tokens signed by `kid_old` have expired.
-- **`INV-OIDC-03 (Least-Privilege Service Scopes)`**: No `client_credentials` M2M token may possess wildcard admin scopes; each service client ID is granted only the explicit scopes required for its bounded context interactions.
+### 3. Per-Service Authorization Policy Matrix
 
-### 4. Proposed Design: OIDC Discovery, Key Rotation & Scoped M2M Identity
+| Target Service & Endpoint Group | Accepted Principal Type | Required Role (`ROLE_*`) | Required Scope (`SCOPE_*`) | Resource Ownership / ABAC Rule |
+| :--- | :--- | :--- | :--- | :--- |
+| `product-service`: `GET /api/v1/products/**` | Public / Any | None | None | Public read |
+| `product-service`: `POST/PUT/DELETE /api/v1/admin/products/**` | Human Admin | `ADMIN_MERCHANT` | `catalog:write` | — |
+| `order-service`: `POST /api/v1/orders`, `GET /api/v1/orders/**` | Human Customer | `CUSTOMER` | `orders:write` / `orders:read` | `order.customer_id == jwt.sub` (`IDOR` protection) |
+| `promotion-service`: `POST /api/v1/flash-sales/{id}/claim` | Human Customer | `CUSTOMER` | `flashsale:claim` | Rate-limited + bound to `jwt.sub` |
+| `inventory-service`: `POST /api/v1/internal/inventory/flash-quota` | M2M Service (`client_credentials`) | `SERVICE_PROMOTION` | `inventory:quota:allocate` | `resolved_client_id == "promotion-service-client"` |
+| `ai-agent-service`: `POST /api/v1/ai/chat/shopping` | Human Customer | `CUSTOMER` | `ai:shopping` | Propagates caller's Bearer JWT to downstream tools (`On-Behalf-Of` user `jwt.sub`) |
+| `ai-agent-service`: `POST /api/v1/ai/chat/ops` | Human Admin | `ADMIN_OPS` | `ai:ops` | Mutating tool proposals gated by Human-in-the-Loop approval |
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Browser as React SPA
-    participant GW as API Gateway (.NET YARP)
-    participant Auth as Customer Service OIDC (or Keycloak)
-    participant Order as Order Service (Java 21)
-
-    Browser->>GW: POST /api/v1/auth/token (login / refresh)
-    GW->>Auth: Forward to OIDC Token Endpoint
-    Note over Auth: Sign JWT with active private key (kid="k-02", alg="RS256")<br/>iss="https://auth.commerce.dev-atlas.lab", aud=["commerce-api"]
-    Auth-->>Browser: 200 OK (access_token, refresh_token)
-
-    Browser->>GW: POST /api/v1/orders (Bearer access_token)
-    Note over GW: Validate RS256 sig (cached JWKS by kid="k-02"), iss, aud, exp
-    GW->>Order: Forward Request + Authorization: Bearer access_token
-    Order->>Auth: (On cache miss / unknown kid) GET http://customer-service:8080/.well-known/jwks.json
-    Auth-->>Order: JWKS { keys: [ {kid: "k-02", ...}, {kid: "k-01", ...} ] }
-    Note over Order: Verify RS256 sig, iss=="https://auth.commerce.dev-atlas.lab", aud, sub
-    Order-->>GW: 201 Created
-```
-
-#### 4.1 Standardized Claims Contract (100% Keycloak-Compatible)
-Both our built-in OIDC provider (`customer-service` in `M2–M5`) and `Keycloak` (when enabled via config in `M6+`) emit tokens conforming to RFC 7519 & RFC 9068 (JWT Profile for OAuth 2.0 Access Tokens):
-- **Human User Access Token**:
-  ```json
-  {
-    "iss": "https://auth.commerce.dev-atlas.lab",
-    "sub": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
-    "aud": ["commerce-api"],
-    "azp": "commerce-web-spa",
-    "scope": "openid profile email orders:write flashsale:claim",
-    "roles": ["CUSTOMER"],
-    "realm_access": { "roles": ["CUSTOMER"] },
-    "jti": "019316b0-1122-7000-9abc-def012345678",
-    "iat": 1794325500,
-    "nbf": 1794325500,
-    "exp": 1794326400
-  }
-  ```
-- **Service-to-Service (`client_credentials`) Access Token**:
-  ```json
-  {
-    "iss": "https://auth.commerce.dev-atlas.lab",
-    "sub": "service-account-promotion-service",
-    "aud": ["inventory-service", "commerce-api"],
-    "azp": "promotion-service-client",
-    "client_id": "promotion-service-client",
-    "scope": "inventory:quota:allocate inventory:read",
-    "roles": ["SERVICE_PROMOTION"],
-    "jti": "019316b0-9999-7000-8abc-def012345678",
-    "iat": 1794325500,
-    "exp": 1794325800
-  }
-  ```
-- **Service Scope Matrix**:
-  - `promotion-service-client`: `scope: "inventory:quota:allocate inventory:read"`
-  - `order-service-client`: `scope: "products:read customers:address:read inventory:read"`
-  - `ai-agent-service`: Uses **On-Behalf-Of / User JWT Propagation** (never uses a god-mode service account to query user orders!).
-
-### 5. Alternatives Evaluated
-- **Alternative 1 (Mutual TLS `mTLS` via Istio/Linkerd Service Mesh for S2S Auth)**: Provides strong workload identity, but running an envoy sidecar per pod across 15+ pods adds `~1.5 GiB` RAM overhead on our 4–5 VM cluster. Standard OAuth2 `client_credentials` JWTs with `scope` claims use `0 MiB` extra infrastructure and work identically in Docker Compose and Kubernetes.
-- **Alternative 2 (Single static RSA key without `kid` rotation)**: Breaks all active sessions whenever keys are rotated.
-
-### 6. Trade-offs
-- Maintaining a `signing_keys` table / key ring supporting `[ACTIVE_SIGNER, VERIFY_ONLY_PREVIOUS]` in `customer-service` adds ~60 lines of C# code, which directly demonstrates production OIDC key rotation mechanics and seamless Keycloak compatibility.
-
-### 7. Acceptance Criteria
-1. **Split-Horizon Discovery Test**: Configure `AUTH_ISSUER_URI=https://auth.commerce.dev-atlas.lab` and `AUTH_JWKS_URI=http://customer-service:8080/.well-known/jwks.json`; verify both Java Spring Security and .NET `JwtBearer` accept valid tokens and reject tokens with a mismatched `iss` or `aud` (`INV-OIDC-01`).
-2. **Zero-Downtime Key Rotation Test**: Issue Token A signed with `kid="k1"`, rotate active key to `kid="k2"` (keeping `k1` as `VERIFY_ONLY` in JWKS), issue Token B signed with `kid="k2"`, and verify Resource Servers accept **both** Token A and Token B until Token A expires (`INV-OIDC-02`).
-3. **Scoped M2M Authorization Test**: Obtain a `client_credentials` token for `promotion-service-client` (`scope="inventory:read"`) and attempt to call an admin payment refund endpoint (`requires scope="payments:refund"`); verify `403 Forbidden` (`INV-OIDC-03`).
-
-### 8. Remaining Questions for Human Architect
-- **`Q-CH05`**: Do you approve the RFC 9068 OIDC token profile, dual-key JWKS rotation (`ACTIVE_SIGNER` + `VERIFY_ONLY`), split `AUTH_ISSUER_URI` / `AUTH_JWKS_URI` resolution, and scoped `client_credentials` for M2M calls?
+### 4. Acceptance Criteria (`CH-05`)
+1. **`id_token` Rejection at Resource Server Test**: Send a valid OIDC `id_token` (`aud: "commerce-web-spa"`) as a Bearer token to `POST /api/v1/orders`; verify `api-gateway` and `order-service` reject it with `401 invalid_token` (missing `aud: "commerce-api"`).
+2. **Keycloak Claim Format Compatibility Test**: Feed a JWT structured with Keycloak's native `realm_access.roles: ["ADMIN_MERCHANT"]`, `azp: "commerce-admin-spa"`, and `typ: "JWT"` into Java, .NET, and Python auth middleware; verify all three runtimes extract `ROLE_ADMIN_MERCHANT` and `client_id = "commerce-admin-spa"` identically without code changes.
 
 ---
 
-## `CH-06`: Multi-Provider Embedding Abstraction, Vector Space Isolation & Zero-Downtime Re-Indexing
+## `CH-06`: `pgvector` Physical Storage vs. ANN Index Limits (`vector` vs. `halfvec`) & Generation Isolation
 
-- **Status:** `PROPOSED` (`M0.2` Revision — Removes `M0.1` Mandatory `vector(768)` Assumption)
+- **Status:** `PROPOSED` (`M0.2.1` Final Correction — Corrects `pgvector` 2,000-Dim `vector` vs. 4,000-Dim `halfvec` Index Limits)
 - **Related ADR:** [`ADR-0008`](file:///home/anhltn/projects/distributed-commerce-platform/docs/adr/ADR-0008-ai-agent-security-boundary-and-pgvector-rag.md)
 
-### 1. Problem
-In `M0.1`, we proposed forcing all embedding providers into a single `vector(768)` column. Your review highlighted two fundamental flaws with that assumption:
-1. **Not all embedding providers/models use 768 dimensions** (e.g., OpenAI `text-embedding-3-small` native is `1536`, `text-embedding-3-large` is `3072`, Cohere/Voyage models use `1024`, Gemini `text-embedding-004` uses `768`).
-2. **Equal dimensions NEVER imply equivalent vector spaces!** Even if Model A (`OpenAI text-embedding-3-small` truncated to `768`) and Model B (`Google Gemini text-embedding-004` native `768`) both output `768` floats, their coordinate spaces are learned from completely different neural network weights and tokenizers. Computing cosine similarity between a query embedded with Gemini (`768`) and product chunks embedded with OpenAI (`768`) produces **mathematically meaningless random noise**!
+### 1. Problem: Hard Physical Limits in PostgreSQL `pgvector` (`0.7+` / `0.8+`)
+In `M0.2`, we listed `3072` dimensions (`OpenAI text-embedding-3-large`) alongside `768`, `1024`, and `1536` on a standard `vector` column. As you challenged, **in PostgreSQL `pgvector`, a standard 32-bit floating-point `vector(3072)` column CANNOT be indexed by a normal HNSW or IVFFlat ANN index!**
+Why? Because PostgreSQL index tuples must fit within a single **8 KB (`8,192 bytes`) heap/index page** (specifically `INDEX_SIZE_MASK` / page item limit):
+- A `3072`-dimensional **float32 (`vector`)** occupies $3072 \times 4\text{ bytes} = 12,288\text{ bytes}$ (`> 8,192 bytes`), which exceeds PostgreSQL's index page limit!
+- Consequently, `pgvector` enforces **strictly different ceilings for unindexed storage vs. ANN indexes, and for `vector` (FP32) vs. `halfvec` (FP16)**:
 
-### 2. Failure Scenarios
+| `pgvector` Data Type | Bytes per Dimension | Max Dimensions Stored (Table Column / Exact Sequential Scan) | Max Dimensions Indexed by **HNSW / IVFFlat ANN Index** | Operator Classes for Cosine Similarity |
+| :--- | :--- | :--- | :--- | :--- |
+| **`vector(D)`** (`32-bit float` / FP32) | `4 bytes` |Up to **`16,000`** dims | **Max `2,000` dims** (`384`, `768`, `1024`, `1536` work; **`3072` FAILS with `ERROR: column cannot have more than 2000 dimensions for hnsw index`**!) | `vector_cosine_ops`, `vector_l2_ops`, `vector_ip_ops` |
+| **`halfvec(D)`** (`16-bit float` / FP16) | `2 bytes` | Up to **`16,000`** dims | **Max `4,000` dims** (Supports `384`, `768`, `1024`, `1536`, AND **`3072`** natively!) | `halfvec_cosine_ops`, `halfvec_l2_ops`, `halfvec_ip_ops` |
+| **`bit(D)`** (Binary Quantized) | `1 bit` | Up to **`64,000`** dims | **Max `64,000` dims** | `bit_hamming_ops`, `bit_jaccard_ops` |
 
-| ID | Failure Scenario | Naive Failure Outcome | Required Safe Outcome |
+### 2. Why Equal Dimensions Never Imply Equivalent Embedding Spaces
+Even when two models output the exact same dimension (e.g., `OpenAI text-embedding-3-small` with `dimensions=768` vs. `Google Gemini text-embedding-004` with `768` dimensions):
+1. **Orthogonal Basis Vectors**: Each model is trained independently via contrastive loss over different transformer architectures and tokenizers. Dimension $i$ in OpenAI's `768`-dimensional unit hypersphere has **zero mathematical correspondence** to dimension $i$ in Gemini's `768`-dimensional hypersphere (up to an unknown high-dimensional rotation/projection that does not even exist isometrically).
+2. **Consequence**: Computing `gemini_query_vec <=> openai_doc_vec` produces pseudo-random cosine similarity scores centered near $0.0$. Therefore, **every vector query MUST be hard-scoped to a single `generation_id`** representing one immutable `(provider, model_name, model_version, dimensions, storage_precision)` tuple (`INV-EMB-01`).
+
+### 3. Trade-offs: FP32 (`vector`) vs. FP16 (`halfvec`) vs. Matryoshka Reduction for `3072d` Models
+
+| Approach for High-Dimensional Models (e.g., `3072d`) | Recall@10 Retention vs. Raw FP32 `3072d` | Index RAM & Disk Footprint (`100K` Chunks) | `pgvector` HNSW Index Support |
 | :--- | :--- | :--- | :--- |
-| `FS-06A` | Operator switches `AI_EMBEDDING_PROVIDER` from `openai` (`text-embedding-3-small`, `v1`, `768d`) to `gemini` (`text-embedding-004`, `v1`, `768d`) without isolating model spaces in SQL queries. | Query vector from Gemini is compared via `<=>` cosine distance against existing OpenAI chunk vectors of the same `768` dimension → **Garbage RAG retrieval & hallucinations!** | Every vector search query MUST filter strictly by `(provider, model_name, model_version, dimensions)` matching the active query encoder (`INV-EMB-01`). |
-| `FS-06B` | Operator switches from a `768`-dimension model to a `1536`-dimension model (`text-embedding-3-small` native `1536d`). | Fixed `vector(768)` column fails with `ERROR: expected 768 dimensions, not 1536`. | Storage design supports arbitrary model dimensions (`768`, `1024`, `1536`, `3072`) without destructive downtime. |
-| `FS-06C` | Re-indexing 10,000 product chunks for a new embedding model takes 3 minutes; users ask questions in the AI Shopping Assistant during the migration. | Deleting old embeddings before new embeddings finish causes 3 minutes of empty RAG results (`0` chunks found). | **Blue/Green Index Generation Pointer (`active_index_generation`)**: New model embeddings are populated in the background under a new `index_generation_id`; the active retrieval pointer flips atomically only after `100%` of chunks are indexed! |
+| **1. `vector(1536)` / `vector(768)` (FP32 for models $\le 2000\text{d}$, or Matryoshka `dimensions=1536` on `text-embedding-3-large`)** | `~99.5%+` (OpenAI Matryoshka MRL `1536d` outperforms `ada-002`) | `1536d FP32`: `~600 MB` | Native `vector_cosine_ops` (`<= 2000d`) |
+| **2. `halfvec(3072)` (FP16 Half-Precision Indexing via `halfvec_cosine_ops`)** | **`~99.8–99.9%`** (Unit-normalized embedding components lie in $[-1, 1]$, where IEEE 754 FP16 has 10 mantissa bits $\approx 3.3$ decimal digits of precision—virtually indistinguishable from FP32 in ANN ranking!) | `3072d FP16`: `~600 MB` (`50%` smaller than FP32!) | Native `halfvec_cosine_ops` (`<= 4000d`) |
+| **3. Unindexed `vector(3072)` Sequential Scan** | `100%` (Exact) | `~1.2 GB` heap table | **None** ($O(N)$ full table scan; latency degrades linearly above `10K` rows). |
 
-### 3. Invariants That Must Always Hold
-- **`INV-EMB-01 (Strict Vector Space Homogeneity)`**: A cosine/inner-product similarity query (`<=>` / `<#>`) is mathematically valid **if and only if** the query vector and every candidate document vector were produced by the exact same `(provider, model_name, model_version, dimensions)` tuple. Cross-model vector comparisons are strictly forbidden at the SQL query layer.
-- **`INV-EMB-02 (Zero-Downtime Model Migration)`**: Switching or upgrading the embedding model must never serve empty or partially indexed RAG results to live users; the previous `(provider, model_name, model_version)` index remains active for reads until the new index generation reaches `READY` status (`100%` coverage).
+### 4. Proposed Design: Precision-Aware Generation Registry & Expression HNSW Indexing
 
-### 4. Proposed Design: Model-Versioned Embedding Registry & Storage Architecture
-
-#### 4.1 Evaluating PostgreSQL / `pgvector` Multi-Dimension Storage Alternatives
-
-We evaluate three concrete ways to store multi-dimension vectors in `ai_agent_db` (`PostgreSQL 17 + pgvector`):
-
-| Storage Option | How It Works in PostgreSQL + `pgvector` | Pros | Cons |
-| :--- | :--- | :--- | :--- |
-| **Option 1: Document/Chunk Table Separated from Dimension-Typed Embedding Tables / Partitions (Recommended)** | Store canonical text & metadata in `knowledge_chunks (chunk_id)` and store embeddings in `chunk_embeddings` with an `embedding_index_generations` registry and expression/partial HNSW indexes per dimension (`(embedding::vector(768))`, `(embedding::vector(1024))`, `(embedding::vector(1536))` or partitioned by `index_generation_id`). | • Supports `768`, `1024`, `1536`, `3072` natively.<br/>• `knowledge_chunks` text is never duplicated during Blue/Green model re-indexing!<br/>• Each `index_generation_id` has its own isolated HNSW index. | Requires a `JOIN` between `chunk_embeddings` and `knowledge_chunks` on `chunk_id` (fast PK join on top-$K=10$ results). |
-| **Option 2: Single Unbounded `vector` Column + Partial Functional HNSW Indexes** | `embedding vector` (without a fixed length modifier on the column) + `CREATE INDEX ... USING hnsw ((embedding::vector(1536)) vector_cosine_ops) WHERE index_generation_id = 'gen_02'`. | Very clean schema; dynamically created partial HNSW index per `index_generation_id` during migration. | Requires creating the partial HNSW index per generation via migration/admin worker. |
-| **Option 3: Fixed Single `vector(768)` Column (`M0.1` Draft)** | Hardcodes `vector(768)` on `knowledge_chunks`. | Simplest DDL. | **Rejected**: Cannot store `1024` or `1536` models and tempts developers to compare incompatible `768d` models in place. |
-
-#### 4.2 Chosen Design (Combining Option 1 + Option 2: Generation-Isolated `chunk_embeddings`)
-
+#### 4.1 Corrected PostgreSQL + `pgvector` Schema (`ai_agent_db`)
 ```sql
--- 1. Tracks each embedding model configuration & Blue/Green lifecycle state
+CREATE EXTENSION IF NOT EXISTS vector;
+
 CREATE TABLE embedding_index_generations (
     generation_id       UUID PRIMARY KEY,
-    provider            VARCHAR(32) NOT NULL,   -- e.g. 'openai', 'gemini', 'anthropic_voyage'
-    model_name          VARCHAR(64) NOT NULL,   -- e.g. 'text-embedding-3-small', 'text-embedding-004'
-    model_version       VARCHAR(32) NOT NULL,   -- e.g. '2024-05', 'v1'
-    dimensions          INTEGER NOT NULL CHECK (dimensions IN (384, 768, 1024, 1536, 3072)),
-    distance_metric     VARCHAR(16) NOT NULL DEFAULT 'COSINE',
+    provider            VARCHAR(32) NOT NULL,   -- 'openai', 'gemini', 'anthropic_voyage'
+    model_name          VARCHAR(64) NOT NULL,   -- 'text-embedding-3-small', 'text-embedding-3-large', 'text-embedding-004'
+    model_version       VARCHAR(32) NOT NULL,   -- 'v1', '2024-05'
+    dimensions          INTEGER NOT NULL CHECK (dimensions BETWEEN 128 AND 4000),
+    index_storage_type  VARCHAR(16) NOT NULL CHECK (
+                            (index_storage_type = 'VECTOR_FP32'  AND dimensions <= 2000) OR
+                            (index_storage_type = 'HALFVEC_FP16' AND dimensions <= 4000)
+                        ),
+    distance_metric     VARCHAR(16) NOT NULL DEFAULT 'COSINE' CHECK (distance_metric IN ('COSINE', 'L2', 'IP')),
+    hnsw_index_name     VARCHAR(128) NOT NULL UNIQUE,
     status              VARCHAR(20) NOT NULL CHECK (status IN ('BUILDING', 'ACTIVE', 'DEPRECATED', 'ARCHIVED')),
     total_chunks        INTEGER NOT NULL DEFAULT 0,
     indexed_chunks      INTEGER NOT NULL DEFAULT 0,
@@ -591,147 +540,95 @@ CREATE TABLE embedding_index_generations (
     activated_at        TIMESTAMPTZ NULL
 );
 
--- At most ONE generation may be ACTIVE at any moment
-CREATE UNIQUE INDEX uq_active_embedding_generation
+-- Enforce at most ONE active generation for live RAG traffic
+CREATE UNIQUE INDEX uq_single_active_embedding_gen
     ON embedding_index_generations ((status))
     WHERE status = 'ACTIVE';
 
--- 2. Canonical source text chunks (provider-agnostic, never duplicated on model switch)
 CREATE TABLE knowledge_chunks (
     chunk_id            UUID PRIMARY KEY,
-    source_type         VARCHAR(32) NOT NULL,   -- 'PRODUCT_SPEC', 'STORE_POLICY', 'FAQ'
-    source_id           VARCHAR(128) NOT NULL,  -- e.g. product_id
+    source_type         VARCHAR(32) NOT NULL,
+    source_id           VARCHAR(128) NOT NULL,
     chunk_index         INTEGER NOT NULL,
     content_text        TEXT NOT NULL,
-    content_hash        CHAR(64) NOT NULL,      -- SHA-256 of content_text (skips re-embedding unchanged text!)
+    content_hash        CHAR(64) NOT NULL,
     metadata            JSONB NOT NULL DEFAULT '{}',
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT uq_source_chunk UNIQUE (source_type, source_id, chunk_index)
+    CONSTRAINT uq_knowledge_source_chunk UNIQUE (source_type, source_id, chunk_index)
 );
 
--- 3. Model-versioned vector embeddings linked to a specific generation
 CREATE TABLE chunk_embeddings (
     generation_id       UUID NOT NULL REFERENCES embedding_index_generations(generation_id) ON DELETE CASCADE,
     chunk_id            UUID NOT NULL REFERENCES knowledge_chunks(chunk_id) ON DELETE CASCADE,
-    dimensions          INTEGER NOT NULL,
-    embedding           vector NOT NULL,        -- Unbounded pgvector column; validated & indexed per generation
+    dimensions          INTEGER NOT NULL CHECK (dimensions BETWEEN 128 AND 4000),
+    embedding           halfvec NOT NULL,       -- Stored as halfvec (or vector) up to 4,000 dims; indexed per generation
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (generation_id, chunk_id),
-    CONSTRAINT chk_vector_dims CHECK (vector_dims(embedding) = dimensions)
+    CONSTRAINT chk_embedding_dims CHECK (halfvec_dims(embedding) = dimensions)
 );
 ```
 
-#### 4.3 Blue/Green Model Migration & Retrieval Flow (Mermaid)
+- **How Per-Generation Partial HNSW Indexes Work**:
+  - When a new generation `gen_uuid` is created (e.g., `dimensions = 768` or `1536` or `3072`), the migration/index builder creates a **generation-scoped partial functional HNSW index**:
+    ```sql
+    -- Works for ANY dimension from 128 up to 4,000 (including 768, 1024, 1536, and 3072!)
+    -- and uses 50% less RAM on our 3.8 GiB VM!
+    CREATE INDEX CONCURRENTLY idx_hnsw_gen_<short_id>
+        ON chunk_embeddings
+        USING hnsw ((embedding::halfvec(3072)) halfvec_cosine_ops)
+        WITH (m = 16, ef_construction = 64)
+        WHERE generation_id = '<gen_uuid>';
+    ```
+  - For dimensions $\le 2000$ where full FP32 `vector` indexing is desired (`index_storage_type = 'VECTOR_FP32'`), `(embedding::vector(1536)) vector_cosine_ops` is supported identically, while the `CHECK` constraint on `embedding_index_generations` **prevents anyone from attempting `VECTOR_FP32` on a column with `dimensions > 2000`**!
 
-```mermaid
-stateDiagram-v2
-    [*] -->Gen1_ACTIVE : Generation 1 (e.g. Gemini text-embedding-004, 768d) is ACTIVE
-    Gen1_ACTIVE --> Gen2_BUILDING : Admin configures OpenAI text-embedding-3-small (1536d) -> Create Gen 2 (BUILDING)
-    note right of Gen2_BUILDING
-      Live user RAG queries STILL use Gen 1 (Gemini 768d)!
-      Background worker embeds all knowledge_chunks into Gen 2 (1536d)
-      and builds partial HNSW index on Gen 2.
-    end note
-    Gen2_BUILDING --> Gen2_ACTIVE : 100% chunks indexed -> Atomic TX: Gen 1 -> DEPRECATED, Gen 2 -> ACTIVE
-    Gen2_ACTIVE --> Gen1_ARCHIVED : Purge Gen 1 vectors after rollback window (e.g. 24h)
-```
-
-- **Retrieval Query Enforcement**:
-  1. `RAGService` reads the current `ACTIVE` row from `embedding_index_generations` (`gen_id`, `provider`, `model_name`, `model_version`, `dimensions`).
-  2. `RAGService` calls `EmbeddingProviderPort.embed_query(text, provider=gen.provider, model=gen.model_name, dimensions=gen.dimensions)`—guaranteeing the query is encoded with the **exact** model that built the active index generation!
-  3. SQL query restricts `WHERE ce.generation_id = :activeGenId`, using that generation's HNSW index.
-
-### 5. Acceptance Criteria
-1. **Cross-Model Isolation Test**: Seed `Gen 1` (`gemini/text-embedding-004/768d`, `ACTIVE`) and `Gen 2` (`openai/text-embedding-3-small/768d`, `BUILDING`). Verify RAG retrieval queries ONLY `Gen 1` vectors and embeds the user query using the `Gen 1` Gemini adapter (`INV-EMB-01`).
-2. **Heterogeneous Dimension Migration Test**: Migrate from `768d` (`Gen 1`) to `1536d` (`Gen 2`). Verify `chk_vector_dims` enforces `1536` on `Gen 2`, live traffic experiences `0` dropped queries during `BUILDING`, and atomic promotion switches queries to `Gen 2` (`INV-EMB-02`).
-
-### 6. Remaining Questions for Human Architect
-- **`Q-CH06`**: Do you approve the **Generation-Isolated `embedding_index_generations` + `chunk_embeddings` schema** with Blue/Green atomic model switching and strict `(provider, model_name, model_version, dimensions)` query coupling?
+### 5. Invariants & Acceptance Criteria (`CH-06`)
+- **`INV-EMB-01 (Model-Generation Query Isolation)`**: Every similarity query MUST bind `WHERE ce.generation_id = :activeGenId` and encode the search query using the exact `(provider, model_name, model_version, dimensions)` recorded on `:activeGenId`.
+- **`INV-EMB-02 (Physical ANN Index Ceiling Enforcement)`**: Any generation with `dimensions > 2000` (up to `4000`, such as `3072`) MUST use `HALFVEC_FP16` (`halfvec_cosine_ops`); `VECTOR_FP32` is permitted only when `dimensions <= 2000`.
+- **`INV-EMB-03 (Blue/Green Atomic Promotion)`**: Live RAG queries read only the `ACTIVE` generation while a new generation builds (`BUILDING`), switching atomically only after `indexed_chunks == total_chunks` and the partial HNSW index is valid (`pg_index.indisvalid = true`).
+- **Acceptance Criteria**:
+  1. **2,000-Dim FP32 Guard Test**: Attempt to register an `embedding_index_generations` row with `dimensions = 3072` and `index_storage_type = 'VECTOR_FP32'`; verify PostgreSQL rejects it via the `CHECK` constraint (`INV-EMB-02`), while `dimensions = 3072` with `HALFVEC_FP16` builds its `halfvec_cosine_ops` HNSW index cleanly and uses `Index Scan using idx_hnsw_gen_...` in `EXPLAIN`.
+  2. **Cross-Model Isolation Test**: Populate two `768d` generations (`Gen A: Gemini` and `Gen B: OpenAI`). Verify that when `Gen A` is `ACTIVE`, `0` rows from `Gen B` are ever scanned or returned (`INV-EMB-01`).
 
 ---
 
-## `CH-07`: Observability Trace Continuity (Parent Spans vs. Span Links), Baggage Privacy & Production-Safe Fault Injection
+## `CH-07`: Observability Trace Continuity, Baggage Zero-Trust & Server-Registered Fault Profiles
 
-- **Status:** `PROPOSED` (`M0.2` Revision)
+- **Status:** `PROPOSED` (Design Direction Approved — Clarified in `M0.2.1`)
 - **Related ADR:** [`ADR-0011`](file:///home/anhltn/projects/distributed-commerce-platform/docs/adr/ADR-0011-observability-opentelemetry-and-lgtm-stack.md)
 
-### 1. Problem
-1. **Trace Propagation & Span Links vs. Parent-Child**: When an HTTP request writes an event to `outbox_messages`, how should OpenTelemetry represent:
-   - The **Batch Outbox Polling Job** (which wakes up every 100ms and fetches `N = 50` rows belonging to `50` different user HTTP traces)?
-   - The **Individual Kafka Message Publish & Consumer Processing** for each specific event?
-   - If the batch poll span tries to set 50 parents, that is invalid in OpenTelemetry (a span can have at most 1 parent). Conversely, if the per-message Kafka consumer span does not link back to the originating HTTP trace, the end-to-end Saga waterfall in Grafana Tempo is broken.
-2. **W3C Baggage Privacy Hazard**: OpenTelemetry supports `baggage` headers that propagate automatically across all downstream HTTP and Kafka hops. If a developer puts PII (e.g., customer email, phone number, JWT, or address) into W3C `baggage`, it leaks into third-party logs and external LLM/payment webhook HTTP requests!
-3. **Fault Injection Production Safety**: We need deterministic chaos/fault simulation hooks for `M4`, `M6`, and `M7` without creating a remotely exploitable backdoor in production builds.
+### 1. Final Security & Operational Clarifications (`M0.2.1`)
+1. **W3C `baggage` Is NEVER Authorization or Identity (`INV-OBS-02`)**:
+   - W3C `baggage` is strictly an **untrusted diagnostic correlation carrier** (restricted at the API Gateway to an allowlist of `correlation.id`, `test.run_id`, and `fault.profile_id`).
+   - Services must **NEVER** read user identity, customer ID, tenant ID, roles, or permissions from `baggage` or OpenTelemetry span attributes. Identity and authorization are derived exclusively from the cryptographically verified RFC 9068 `Authorization: Bearer <access_token>` (or signed Kafka event envelope).
+2. **Server-Side Registered Fault Profile Lookup (Zero Arbitrary Client Parameters)**:
+   - Even in staging/chaos environments where `FAULT_INJECTION_ENABLED=true`, callers **cannot** pass raw delay durations, SQL strings, or arbitrary exception class names in headers (e.g., `X-Fault-Inject: delay=999999` is rejected).
+   - Instead, chaos experiments reference an immutable **Server-Side Fault Profile ID** (e.g., `fault.profile_id = "FP-PAY-GATEWAY-TIMEOUT-5S"` or `"FP-INV-DB-LOCK-CONTENTION"`) defined in a read-only server configuration map (`fault-profiles.yaml`) that specifies:
+     - `profileId`: `"FP-PAY-GATEWAY-TIMEOUT-5S"`
+     - `allowedTargetServices`: `["payment-service"]` (Target Allowlist — ignored by all other services!)
+     - `allowedTargetOperations`: `["POST:/api/v1/payments/{orderId}/confirm"]`
+     - `maxDurationMs`: `5000` (Hard-capped ceiling)
+     - `behavior`: `SIMULATE_GATEWAY_TIMEOUT`
+3. **Unavailable in Production (`INV-OBS-03`)**:
+   - Production container builds / Helm charts set `FAULT_INJECTION_ENABLED=false` (and read-only config), preventing the fault-injection middleware/beans from being registered in the DI container at startup.
+   - Any attempt to pass `X-Fault-Profile-Id` or `baggage: fault.profile_id=...` when `FAULT_INJECTION_ENABLED=false` is stripped at the Gateway; when `FAULT_INJECTION_ENABLED=true` (chaos test environment), it requires a verified JWT with `ROLE_ADMIN_OPS` + `SCOPE_chaos:inject` and emits a mandatory structured audit log (`CHAOS_FAULT_PROFILE_ACTIVATED` with `actor_sub`, `profile_id`, `target_service`, `trace_id`).
 
-### 2. Failure Scenarios
-
-| ID | Failure Scenario | Naive Failure Outcome | Required Safe Outcome |
-| :--- | :--- | :--- | :--- |
-| `FS-07A` | Outbox Relay polls 50 messages from 50 different orders in one batch. | Either all 50 messages share a random background `trace_id` (losing user trace correlation) OR the batch span crashes trying to attach 50 parents. | Follow **OpenTelemetry Messaging Semantic Conventions**:<br/>• The `outbox.poll_batch` span is a root span with **Span Links** to the 50 message contexts.<br/>• Each individual `kafka.publish` + `kafka.consume` span restores that message's stored `traceparent` as its parent (or linked context) so each Order's Saga trace remains a continuous waterfall in Tempo! |
-| `FS-07B` | Developer attaches `user.email` to W3C `baggage` header; `ai-agent-service` or `payment-service` makes an outbound HTTPS call, leaking `baggage` header externally. | PII leaked to external APIs and proxy access logs. | Outbound HTTP clients to external domains strip `baggage`; W3C `baggage` is restricted by an allowlist filter (`correlation.id`, `test.run_id`, `fault.profile_id` only—zero PII). |
-| `FS-07C` | Attacker sends `X-Fault-Inject: delay=10000ms,status=500` to `POST /api/v1/orders` in production. | Attacker triggers self-inflicted Denial of Service! | Fault injection middleware is **excluded/disabled at two independent gates**: (1) Environment/Build gate (`FAULT_INJECTION_ENABLED=false` default), AND (2) even in staging/chaos environments, requires a cryptographically signed JWT with role `ADMIN_OPS` + scope `chaos:inject`. |
-
-### 3. Invariants That Must Always Hold
-- **`INV-OBS-01 (End-to-End Saga Traceability)`**: Given any `orderId` or `traceId` returned in an HTTP response or `ProblemDetails`, querying Grafana Tempo by `traceId` (or tag `commerce.order_id`) MUST surface the complete chain of HTTP, Outbox publish, Kafka consumer, and DB spans across Java, .NET, and Python.
-- **`INV-OBS-02 (Zero PII in W3C Baggage & Span Attributes)`**: Passwords, raw JWTs, email addresses, phone numbers, and street addresses must NEVER be placed in W3C `baggage` or unredacted OpenTelemetry span attributes.
-- **`INV-OBS-03 (Dual-Gated Fault Injection)`**: No fault injection directive (`simulatorMode` override or latency/exception injection) may execute unless **both** `FAULT_INJECTION_ENABLED == true` in server config **and** the request is authenticated with an authorized `chaos:inject` / test-harness credential (or is an internal Payment Simulator test account in non-prod).
-
-### 4. Proposed Design: OpenTelemetry Outbox/Inbox Propagation & Dual-Gated Fault Injection
-
-#### 4.1 Trace Context & Span Link Topology Across Outbox/Inbox (Mermaid)
-
-```mermaid
-flowchart TB
-    subgraph TraceA["User Order Trace A (trace_id = T_AAA)"]
-        S1["HTTP POST /api/v1/orders (span_id = S_101)"]
-        S2["DB TX: Insert Order + Outbox (span_id = S_102, parent = S_101)<br/>Stores traceparent='00-T_AAA-S_102-01' in outbox_messages.headers"]
-        S3["Kafka Publish commerce.order.events.v1 (span_id = S_103, parent = S_102)"]
-        S4["Inventory Consumer: Process OrderCreated (span_id = S_104, parent = S_103)<br/>+ SpanLink to Batch Poll Span B_999"]
-        S1 --> S2 --> S3 --> S4
-    end
-
-    subgraph TraceBatch["Background Outbox Poll Batch Trace (trace_id = T_BATCH)"]
-        B1["Outbox Relay Poll Batch (span_id = B_999)<br/>Batch Size = 50 rows"]
-    end
-
-    B1 -.->|"SpanLink (follows_from)"| S3
-```
-
-1. **At `INSERT INTO outbox_messages` Time**:
-   - Extract current active span's `traceparent` (`00-{traceId}-{spanId}-{flags}`) and allowed `tracestate`, storing them in `outbox_messages.headers` (`JSONB`).
-2. **At Outbox Relay Poll Time**:
-   - Start a single `outbox.relay.batch` span (`batch.size = N`) for operational monitoring of the poller itself.
-   - For each `outbox_message` row in the batch:
-     - Reconstruct the saved `Context` from `row.headers["traceparent"]`.
-     - Start a `PRODUCER` span (`{topic} publish`) with **parent = saved `row.headers["traceparent"]`** and a **SpanLink** pointing to `outbox.relay.batch`.
-     - Inject the updated `traceparent` into the Kafka `ProducerRecord` headers.
-3. **At Kafka Consumer (`Inbox`) Time**:
-   - Extract `traceparent` from Kafka record headers and start a `CONSUMER` span (`{topic} process`) as a child of the producer span, attaching semantic attributes `messaging.system = "kafka"`, `messaging.destination.name = topic`, `messaging.kafka.consumer.group = groupId`, `messaging.message.id = eventId`, and `commerce.aggregate.id = aggregateId`.
-
-#### 4.2 Production Safety Controls for Fault Injection & Payment Simulator
-1. **Control 1 — Gateway Header Stripping**: `api-gateway` unconditionally strips `X-Fault-*` headers from all external requests unless `FAULT_INJECTION_ENABLED == true` AND the caller's verified JWT carries `roles: ["ADMIN_OPS"]` + `scope: "chaos:inject"`.
-2. **Control 2 — Service-Level Conditional Bean / Middleware Registration**:
-   - In Java (`@ConditionalOnProperty(name = "commerce.fault-injection.enabled", havingValue = "true", matchIfMissing = false)`) and .NET (`if (builder.Configuration.GetValue<bool>("FaultInjection:Enabled"))`), the fault-injection interceptor is **not even registered in the DI container or middleware pipeline** when `false` (the default in production Helm charts).
-3. **Control 3 — Audit Logging**: Every activated fault injection rule logs a `WARN` event with `event.type = "CHAOS_FAULT_INJECTED"`, `actor.sub`, and `trace_id`.
-
-### 5. Acceptance Criteria
-1. **End-to-End Trace Continuity Test**: Execute `POST /api/v1/orders` and query Tempo for the returned `traceId`; verify the single trace tree contains the Gateway span, `order-service` HTTP span, `order-service` Outbox publish span, `inventory-service` Kafka consumer span, and `payment-service` span (`INV-OBS-01`).
-2. **Baggage Redaction Test**: Send a request with `baggage: user.email=secret@example.com,correlation.id=123`; verify `user.email` is stripped at the Gateway and never appears in downstream spans or outbound headers (`INV-OBS-02`).
-3. **Fault Injection Production Lockout Test**: With `FAULT_INJECTION_ENABLED=false` (default), send fault-injection headers and simulator override parameters; verify they are completely ignored (`INV-OBS-03`). With `FAULT_INJECTION_ENABLED=true` and an unprivileged `CUSTOMER` JWT, verify `X-Fault-*` headers are rejected with `403 Forbidden`.
-
-### 6. Remaining Questions for Human Architect
-- **`Q-CH07`**: Do you approve the OpenTelemetry Outbox/Inbox propagation model (per-message parent restoration + SpanLink to batch poller), the W3C `baggage` allowlist, and the dual-gated (`DI registration + ADMIN_OPS RBAC`) fault injection controls?
+### 2. Acceptance Criteria (`CH-07`)
+1. **Outbox Parent + Batch SpanLink Verification**: Verify in Tempo that a single order's HTTP → Outbox → Kafka → Inventory/Payment trace forms one continuous parent-child tree, while the background `outbox.relay.batch` span links to each published message via OpenTelemetry `SpanLink` (`INV-OBS-01`).
+2. **Baggage Zero-Trust & Allowlist Test**: Inject `baggage: sub=admin,roles=ADMIN_OPS,user.email=leak@test.com,correlation.id=abc`; verify the Gateway strips `sub`, `roles`, and `user.email` before forwarding, and downstream authorization ignores `baggage` completely (`INV-OBS-02`).
+3. **Fault Profile Allowlist & Production Lockout Test**:
+   - In production mode (`FAULT_INJECTION_ENABLED=false`), verify fault profile interceptors are absent from the Spring/.NET/FastAPI request pipeline.
+   - In chaos mode (`FAULT_INJECTION_ENABLED=true`) with a valid `ADMIN_OPS` (`chaos:inject`) token, verify that requesting an unregistered profile ID (`FP-UNKNOWN`) or targeting a non-allowlisted service (`product-service` for a `payment-service`-only profile) is rejected and logged (`INV-OBS-03`).
 
 ---
 
-## Summary Checklist of `M0.2` Decisions Requiring Your Approval
+## Summary Table of All `CH-01` – `CH-07` Statuses after `M0.2.1`
 
-| Challenge ID | Refined Design Summary | Status |
-| :--- | :--- | :--- |
-| **`CH-01`** | Two-Phase Flash Sale Claim Lease with **PostgreSQL Tombstone Fencing (`ABANDONED_FENCED`) BEFORE Redis Restock**, `HSETNX released_claims` at-most-once restock guard, and 6-state `FlashSaleClaim` machine. | `PROPOSED` |
-| **`CH-02`** | Strictly separated **`Order` State Machine** (commercial/inventory commitment) and **`Payment` State Machine** (`Auth -> Capture/Void` + `Direct Capture -> Auto-Refund` on late webhook) with monotonic webhook state ranks. | `PROPOSED` |
-| **`CH-03`** | **Two-Class Idempotency Protocol**: Class A (atomic single-TX) vs. Class B (`STARTED -> UNKNOWN_RETRYABLE -> COMPLETED` preserving `downstream_operation_id` across timeouts) + RFC 8785 canonical `SHA-256` payload hashing. | `PROPOSED` |
-| **`CH-04`** | Mandatory `aggregateVersion` in event envelope + `outbox_sequence`, **Tombstone rows** (`RELEASED / CANCELLED_TOMBSTONE`) when cancel arrives before create, and 3-tier retry + state-guarded DLQ replay. | `PROPOSED` |
-| **`CH-05`** | RFC 9068 OIDC token profile, split `AUTH_ISSUER_URI` (logical claim) vs. `AUTH_JWKS_URI` (internal fetch), dual-key JWKS rotation (`ACTIVE_SIGNER` + `VERIFY_ONLY`), and least-privilege scoped `client_credentials` M2M tokens. | `PROPOSED` |
-| **`CH-06`** | Generation-isolated **`embedding_index_generations` + `chunk_embeddings`** schema supporting arbitrary dimensions (`768`, `1024`, `1536`, `3072`), strict `(provider, model, version, dims)` query filtering, and Blue/Green atomic re-indexing. | `PROPOSED` |
-| **`CH-07`** | OpenTelemetry per-message `traceparent` restoration across Outbox/Inbox + **SpanLink** to batch poller, W3C `baggage` PII allowlist filter, and dual-gated (`@ConditionalOnProperty` + `ADMIN_OPS` `chaos:inject` scope) fault injection. | `PROPOSED` |
+| Challenge ID | Title | `M0.2.1` Status | Ready for Final Sign-Off? |
+| :--- | :--- | :--- | :--- |
+| **`CH-01`** | Flash Sale Claim Lifecycle, Single-TX Atomicity, Concurrent Writer/Reconciler Lock Serialization, Atomic Lua Release & Redis Failover | `PROPOSED` *(Direction Approved)* | **Yes** |
+| **`CH-02`** | Decoupled Order & Payment State Machines with Explicit Transition Matrices & Recorded Fact Timestamps (No Scalar Ranks) | `PROPOSED` *(Corrected in `M0.2.1`)* | **Yes** |
+| **`CH-03`** | Two-Class Idempotency with Monotonic `lease_generation` Fencing & Mandatory `RECONCILING` Pre-Retry Check | `PROPOSED` *(Corrected in `M0.2.1`)* | **Yes** |
+| **`CH-04`** | Head-of-Aggregate Serialized Outbox Relay (`SKIP LOCKED`), DB vs. Kafka Ordering & Consumer Version-Gap Handling | `PROPOSED` *(Corrected in `M0.2.1`)* | **Yes** |
+| **`CH-05`** | OIDC `id_token` vs. RFC 9068 OAuth2 `access_token`, Keycloak Claim Normalization & Per-Service Policy Matrix | `PROPOSED` *(Direction Approved)* | **Yes** |
+| **`CH-06`** | `pgvector` Physical Storage (`16,000d`) vs. ANN Index Ceilings (`2,000d` `vector` FP32 vs. `4,000d` `halfvec` FP16) & Generation Isolation | `PROPOSED` *(Corrected in `M0.2.1`)* | **Yes** |
+| **`CH-07`** | OpenTelemetry Outbox Parent + Batch SpanLink, Baggage Zero-Trust & Server-Allowlisted Fault Profiles | `PROPOSED` *(Direction Approved)* | **Yes** |

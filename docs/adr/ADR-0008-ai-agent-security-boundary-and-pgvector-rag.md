@@ -1,32 +1,35 @@
-# ADR-0008: Multi-Provider AI Abstraction, Generation-Isolated `pgvector` RAG & Zero-Privilege Boundary
+# ADR-0008: Multi-Provider AI Abstraction, `pgvector` Physical Index Limits (`vector` vs. `halfvec`) & Generation Isolation
 
-- **Status:** `ACCEPTED` (`Q7` Multi-Provider AI Abstraction & Zero-Privilege Boundary Accepted in `M0.1`; `CH-06` Generation-Isolated Multi-Dimension Embedding Schema `PROPOSED` in `M0.2`)
+- **Status:** `ACCEPTED` (`Q7` Multi-Provider AI Abstraction & Zero-Privilege Boundary Accepted in `M0.1`; `CH-06` `pgvector` Physical Index Ceiling & Generation Isolation Corrections `PROPOSED` in `M0.2.1`)
 - **Date:** 2026-11-10
 - **Deciders:** Human Architect, Solution Architect Agent
 
 ## 1. Context & Problem
 We are building `ai-agent-service` (`Python 3.12+`, `FastAPI`) with provider abstraction (`OpenAI`, `Google Gemini`, `Anthropic` — `Q7`).
-In `M0.1`, we initially suggested forcing all providers into a fixed `vector(768)` column. In `M0.2`, we remove that flawed assumption because:
-1. Different models have different native dimensions (`768`, `1024`, `1536`, `3072`).
-2. **Equal dimensions do NOT imply compatible vector spaces**: comparing a `768d` Gemini query vector against `768d` OpenAI document vectors computes meaningless cosine distances across orthogonal latent spaces.
+To engineer the `pgvector` RAG store (`ai_agent_db`) accurately (`CH-06`), we must account for two fundamental constraints:
+1. **Equal dimensions never imply equivalent vector spaces**: Comparing a `768d` Gemini vector against a `768d` OpenAI vector produces meaningless cosine distances across orthogonal latent spaces.
+2. **Physical `pgvector` ANN Index Limits (PostgreSQL 8 KB Page Limit)**:
+   - While an unindexed `vector` or `halfvec` column can store up to **`16,000` dimensions**, **HNSW and IVFFlat ANN indexes support at most `2,000` dimensions for 32-bit float `vector` (`vector_cosine_ops`)** and up to **`4,000` dimensions for 16-bit float `halfvec` (`halfvec_cosine_ops`)**!
+   - Therefore, a `3072`-dimensional embedding (`OpenAI text-embedding-3-large`) **cannot** use a normal `vector` HNSW/IVFFlat index and must either be indexed as **`halfvec(3072)` (`halfvec_cosine_ops`)** or use Matryoshka dimension reduction (`dimensions <= 2000`).
 
 ## 2. Options Considered
-- **Option A**: Single fixed `vector(768)` column shared across providers (`M0.1` draft).
-- **Option B**: **Multi-Provider Port Abstraction + Generation-Isolated `embedding_index_generations` & `chunk_embeddings` Schema (`CH-06`) + Blue/Green Atomic Re-Indexing + Zero-Privilege JWT-Bound Tool Calling**.
+- **Option A**: Single fixed `vector(768)` column shared across providers.
+- **Option B**: Unbounded `vector` assuming `3072` dimensions can use standard `vector_cosine_ops` HNSW (`M0.2` draft).
+- **Option C**: **Multi-Provider Port Abstraction + Generation-Isolated `embedding_index_generations` & `chunk_embeddings` Schema Enforcing `VECTOR_FP32 (<= 2000d)` vs. `HALFVEC_FP16 (<= 4000d)` ANN Index Ceilings (`CH-06`) + Blue/Green Atomic Re-Indexing**.
 
 ## 3. Decision
 1. **Accepted Baseline (`ACCEPTED`)**:
    - `ChatCompletionProviderPort` and `EmbeddingProviderPort` abstract **OpenAI**, **Google Gemini**, and **Anthropic**.
-   - `ai-agent-service` connects ONLY to `ai_agent_db` (`PostgreSQL 17 + pgvector`), never to business databases, Redis, or Kafka, and binds customer identity strictly from the caller's verified JWT (`sub`).
-2. **Refined Embedding Storage & Migration Architecture (`PROPOSED` in `M0.2` — See [`ARCHITECTURE_CHALLENGE_M0_1.md#ch-06`](file:///home/anhltn/projects/distributed-commerce-platform/docs/architecture/ARCHITECTURE_CHALLENGE_M0_1.md))**:
-   - Separate canonical text (`knowledge_chunks` with `content_hash`) from model-specific vectors (`chunk_embeddings` linked to `embedding_index_generations`).
-   - Record `(provider, model_name, model_version, dimensions, distance_metric, status)` on every `embedding_index_generations` row.
-   - Enforce **Vector Space Homogeneity (`INV-EMB-01`)**: RAG retrieval always embeds the user query using the exact `(provider, model_name, model_version, dimensions)` of the single `ACTIVE` generation and filters `WHERE generation_id = :activeGenId`.
-   - Support **Zero-Downtime Blue/Green Model Migration (`INV-EMB-02`)**: Build new model embeddings in `BUILDING` state while live traffic reads the current `ACTIVE` generation, then flip `ACTIVE` atomically once `100%` indexed.
+   - `ai-agent-service` connects ONLY to `ai_agent_db`, never to business databases, Redis, or Kafka, and binds caller identity strictly from the verified JWT (`sub`).
+2. **Refined `M0.2.1` `pgvector` Storage, Indexing & Migration Architecture (`PROPOSED` — See [`ARCHITECTURE_CHALLENGE_M0_1.md#ch-06`](file:///home/anhltn/projects/distributed-commerce-platform/docs/architecture/ARCHITECTURE_CHALLENGE_M0_1.md))**:
+   - **Database-Enforced ANN Index Ceiling (`INV-EMB-02`)**: `embedding_index_generations` enforces `CHECK ((index_storage_type = 'VECTOR_FP32' AND dimensions <= 2000) OR (index_storage_type = 'HALFVEC_FP16' AND dimensions <= 4000))`.
+   - **Half-Precision (`halfvec`) Indexing**: `chunk_embeddings` stores vectors and builds per-generation partial functional HNSW indexes (`USING hnsw ((embedding::halfvec(D)) halfvec_cosine_ops) WHERE generation_id = '...'`), supporting `384`, `768`, `1024`, `1536`, and `3072` dimensions natively with `~99.8%+` recall retention and `50%` RAM savings on our `3.8 GiB` VM.
+   - **Strict Model-Generation Isolation (`INV-EMB-01`)**: Every RAG similarity query filters `WHERE generation_id = :activeGenId` and encodes the user query with the exact `(provider, model_name, model_version, dimensions)` of that active generation.
+   - **Zero-Downtime Blue/Green Migration (`INV-EMB-03`)**: New generations are populated and HNSW-indexed in `BUILDING` state while live traffic reads the `ACTIVE` generation, flipping atomically once `100%` indexed.
 
 ## 4. Consequences & Trade-offs
-- **Positive**: Supports `384`, `768`, `1024`, `1536`, and `3072` dimensions natively; mathematically prevents cross-model vector space contamination; zero RAG downtime during model upgrades.
-- **Negative / Cost**: Requires a PK `JOIN` between `chunk_embeddings` and `knowledge_chunks` on top-$K$ retrieved chunks (`<1ms` overhead).
+- **Positive**: Respects real PostgreSQL `pgvector` HNSW/IVFFlat page-size limits; supports `3072d` models via `halfvec_cosine_ops` without index creation failures; cuts vector index RAM in half.
+- **Negative / Cost**: FP16 (`halfvec`) has 10 mantissa bits vs. FP32's 23 mantissa bits (`<0.2%` top-10 recall difference on normalized unit embeddings, with optional FP32 `vector_cosine_ops` available for any generation $\le 2000$ dimensions).
 
 ## 5. Rejected Alternatives
-- **Option A (Shared `vector(768)` column across models)**: Rejected in `M0.2` because equal dimensionality never implies shared semantic coordinates across different models.
+- **Option B (Assuming `vector(3072)` works with standard `vector_cosine_ops` HNSW)**: Fails in PostgreSQL `pgvector` with `ERROR: column cannot have more than 2000 dimensions for hnsw index`.
