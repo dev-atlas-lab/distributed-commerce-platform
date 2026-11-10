@@ -2,8 +2,8 @@
 
 - **Repository:** `dev-atlas-lab/distributed-commerce-platform`
 - **Organization:** [dev-atlas-lab](https://github.com/dev-atlas-lab)
-- **Milestone:** `M0.1 — Architecture Baseline Locked & Deep Challenge Review`
-- **Status:** `ACCEPTED` (Core Decisions `Q1–Q7` Accepted; Phase 4 Deep Challenges `CH-01`–`CH-07` `PROPOSED` for Final Gate)
+- **Milestone:** `M0.2 — Architecture Challenge Refinement (CH-01 to CH-07)`
+- **Status:** `ACCEPTED` (Core Decisions `Q1–Q7` Accepted; Refined `CH-01`–`CH-07` Specifications in `PROPOSED` / `DISCUSSION` for Final Gate)
 - **Last Updated:** 2026-11-10
 
 ---
@@ -68,11 +68,18 @@ distributed-commerce-platform/
 │   │   ├── ADR-0007-catalog-search-postgresql-fts-vs-opensearch.md
 │   │   ├── ADR-0008-ai-agent-security-boundary-and-pgvector-rag.md
 │   │   ├── ADR-0009-on-prem-kubernetes-k3s-vs-kubeadm-and-storage.md
-│   │   └── ADR-0010-event-contracts-json-schema-and-kafka-kraft.md
+│   │   ├── ADR-0010-event-contracts-json-schema-and-kafka-kraft.md
+│   │   └── ADR-0011-observability-opentelemetry-and-lgtm-stack.md
+│   ├── infrastructure/
+│   │   └── INFRASTRUCTURE_AND_KUBERNETES_STRATEGY.md
+│   ├── roadmap/
+│   │   └── MILESTONE_ROADMAP.md
 │   ├── security/
 │   │   └── SECURITY_ARCHITECTURE.md
 │   ├── performance/
 │   │   └── PERFORMANCE_STRATEGY.md
+│   ├── reports/
+│   │   └── REPOSITORY_BOOTSTRAP_REPORT.md
 │   ├── runbooks/
 │   └── engineering-case-studies/
 ├── frontend/                     # (Scaffolded in M1) React 19 + TS Storefront & Admin UI
@@ -117,5 +124,12 @@ All 7 foundational decisions (`Q1–Q7`) have been reviewed and **approved (`Sta
 6. **Q6 (`ACCEPTED` — [`ADR-0007`](file:///home/anhltn/projects/distributed-commerce-platform/docs/adr/ADR-0007-catalog-search-postgresql-fts-vs-opensearch.md))**: Start with **PostgreSQL 17 Full-Text Search (`tsvector` + `pg_trgm` + `JSONB` GIN)** and benchmark with `k6` before considering **OpenSearch**.
 7. **Q7 (`ACCEPTED` — [`ADR-0008`](file:///home/anhltn/projects/distributed-commerce-platform/docs/adr/ADR-0008-ai-agent-security-boundary-and-pgvector-rag.md))**: Use a **Multi-Provider AI Abstraction Port** supporting **OpenAI**, **Google Gemini**, and **Anthropic Claude** behind a zero-privilege API-only tool boundary.
 
-### Pending Phase 4 Deep Architecture Challenges (`Status: PROPOSED`)
-See [`docs/architecture/ARCHITECTURE_CHALLENGE_M0_1.md`](file:///home/anhltn/projects/distributed-commerce-platform/docs/architecture/ARCHITECTURE_CHALLENGE_M0_1.md) for the 7 concrete edge-case proposals (`CH-01` through `CH-07`) awaiting your decision before we start `M1`.
+### Pending `M0.2` Deep Architecture Challenge Refinements (`Status: PROPOSED`)
+See [`docs/architecture/ARCHITECTURE_CHALLENGE_M0_1.md`](file:///home/anhltn/projects/distributed-commerce-platform/docs/architecture/ARCHITECTURE_CHALLENGE_M0_1.md) for the 7 comprehensive `M0.2` engineering specifications (`CH-01` through `CH-07`) awaiting your explicit approval (`Q-CH01` through `Q-CH07`) before we start `M1`:
+- **`CH-01` (`Q-CH01`)**: Flash Sale Two-Phase Claim Lease + **PostgreSQL Tombstone Fencing (`ABANDONED_FENCED`) before Redis Restock** (replacing the 30s timeout assumption) + `HSETNX released_claims` at-most-once restock guard.
+- **`CH-02` (`Q-CH02`)**: Orthogonal **`Order` State Machine** vs. **`Payment` State Machine** (`Auth -> Capture/Void` + `Direct Capture -> Auto-Refund` on late webhook, replacing the 2s clock buffer) + monotonic webhook state precedence ranks.
+- **`CH-03` (`Q-CH03`)**: **Two-Class Idempotency Protocol** (`Class A` single-TX atomic vs. `Class B` checkpointed state machine preserving `downstream_operation_id` across `UNKNOWN_RETRYABLE` timeouts—never deleting records on `5xx` after external side effects) + RFC 8785 canonical `SHA-256` payload hashing.
+- **`CH-04` (`Q-CH04`)**: Mandatory `aggregateVersion` + `outbox_sequence` ordering, explicit ordering boundary matrix, **Terminal Tombstones** for out-of-order cancellations, and state-guarded DLQ replay.
+- **`CH-05` (`Q-CH05`)**: RFC 9068 OIDC token profile, split `AUTH_ISSUER_URI` (logical claim) vs. `AUTH_JWKS_URI` (internal fetch), dual-key JWKS rotation (`ACTIVE_SIGNER` + `VERIFY_ONLY`), and least-privilege scoped `client_credentials` M2M identity.
+- **`CH-06` (`Q-CH06`)**: Generation-isolated **`embedding_index_generations` + `chunk_embeddings`** schema supporting arbitrary model dimensions (`384`, `768`, `1024`, `1536`, `3072`), strict `(provider, model_name, model_version, dimensions)` vector-space isolation, and Blue/Green zero-downtime re-indexing.
+- **`CH-07` (`Q-CH07`)**: OpenTelemetry per-message `traceparent` restoration across Outbox/Inbox + **SpanLink** to batch poller, W3C `baggage` PII allowlist, and dual-gated (`DI registration + ADMIN_OPS chaos:inject scope`) fault injection.

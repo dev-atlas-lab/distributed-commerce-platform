@@ -1,30 +1,29 @@
-# ADR-0006: `.NET 10` YARP API Gateway & Standards-Compliant OIDC/JWT Architecture (Keycloak-Ready)
+# ADR-0006: `.NET 10` YARP API Gateway, Standards-Compliant OIDC/JWT & Scoped Service Identity
 
-- **Status:** `ACCEPTED` (Approved in M0.1 — Q5 Standards-Compliant OIDC from Day 1, Keycloak-Ready)
+- **Status:** `ACCEPTED` (`Q5` Standards-Compliant OIDC from Day 1, Keycloak-Ready Accepted in `M0.1`; `CH-05` Split-Horizon Discovery, Key Rotation & M2M Scopes `PROPOSED` in `M0.2`)
 - **Date:** 2026-11-10
 - **Deciders:** Human Architect, Solution Architect Agent
 
 ## 1. Context & Problem
-We need an API Gateway for unified edge routing, rate limiting, and correlation ID injection, alongside an Authentication & Authorization architecture across `.NET 10`, `Java 21`, and `Python 3.12+` services that is **100% standards-compliant OIDC from Day 1** without requiring a `~1 GiB` Keycloak container in `M2`, yet allows seamless drop-in migration to **Keycloak** later (`Q5`).
+We need an API Gateway (`.NET 10 YARP`) and an OIDC/OAuth2 architecture across `.NET 10`, `Java 21`, and `Python 3.12+` that is standards-compliant from Day 1 (`Q5`) and ready for seamless **Keycloak** introduction later, while solving split-horizon Docker/K8s discovery (`iss` vs. internal `jwks_uri`), zero-downtime signing key rotation (`kid`), and least-privilege service-to-service (`client_credentials`) authentication (`CH-05`).
 
 ## 2. Options Considered
-- **Option A**: Custom non-standard symmetric `HS256` JWT shared secret across all services.
-- **Option B (Chosen)**: **Standards-Compliant OIDC Discovery (`/.well-known/openid-configuration` & `/.well-known/jwks.json`) + Asymmetric `RS256` JWTs issued by `customer-service` in `M2–M5`, with zero-code-change configuration switch to `Keycloak` in `M6+`**.
-- **Option C**: Mandatory Keycloak deployment in `M1/M2`.
+- **Option A**: Symmetric `HS256` shared secret + flat `"INTERNAL_SERVICE"` god-role.
+- **Option B**: **Standards-Compliant OIDC (`/.well-known/openid-configuration`, `/.well-known/jwks.json`) + `RS256` JWTs (RFC 9068 Profile) + Split Issuer/JWKS Resolution + Dual-Key Rotation + Scoped `client_credentials` M2M Identity (`CH-05`)**.
 
-## 3. Decision (`ACCEPTED`)
-1. **API Gateway**: Adopt **`.NET 10 + YARP`** (`services/dotnet/api-gateway`) with Redis-backed distributed rate limiting.
-2. **Standards-Compliant OIDC Design from Day 1 (`Q5 — ACCEPTED`)**:
-   - `customer-service` exposes standard OIDC metadata endpoints:
-     - `GET /.well-known/openid-configuration` (`issuer`, `jwks_uri`, `token_endpoint`, `id_token_signing_alg_values_supported: ["RS256"]`)
-     - `GET /.well-known/jwks.json` (public RSA key set with explicit `kid`, `kty`, `use: "sig"`, `alg: "RS256"`, `n`, `e`)
-   - All issued Access Tokens (`15m` TTL) use standard OIDC/JWT claims: `iss`, `sub`, `aud`, `exp`, `nbf`, `iat`, `jti`, `scope`, and `roles` (mapped cleanly from both top-level `roles` and Keycloak's `realm_access.roles` claim structure via a unified claim transformer).
-   - All downstream Resource Servers (`api-gateway`, `product-service`, `order-service`, `inventory-service`, `payment-service`, `promotion-service`, `ai-agent-service`) validate tokens strictly via `AUTH_ISSUER_URI` OIDC discovery—never hardcoding public keys or custom proprietary token validation logic.
-   - When **Keycloak** is introduced in `M6` (or any environment profile), switching from built-in OIDC to Keycloak requires changing only `AUTH_ISSUER_URI` in environment configuration.
+## 3. Decision
+1. **Accepted Baseline (`ACCEPTED`)**:
+   - `.NET 10 + YARP` serves as the edge API Gateway.
+   - `customer-service` implements standard OIDC Discovery and `RS256` JWT issuance in `M2–M5`, swappable with **Keycloak** via configuration in `M6+`.
+2. **Refined OIDC & Service Identity Specifications (`PROPOSED` in `M0.2` — See [`ARCHITECTURE_CHALLENGE_M0_1.md#ch-05`](file:///home/anhltn/projects/distributed-commerce-platform/docs/architecture/ARCHITECTURE_CHALLENGE_M0_1.md))**:
+   - **Public vs. Internal Discovery Resolution**: Resource servers validate the JWT `iss` claim against logical `AUTH_ISSUER_URI` (`https://auth.commerce.dev-atlas.lab`) while fetching JWKS keys over internal cluster network `AUTH_JWKS_URI` (`http://customer-service:8080/.well-known/jwks.json`).
+   - **Zero-Downtime Key Rotation (`kid`)**: `/.well-known/jwks.json` publishes both the `ACTIVE_SIGNER` key and the previous `VERIFY_ONLY` key for $\ge 2 \times \text{MaxTokenTTL}$ (`30m`).
+   - **Keycloak-Compatible Claim Mapping**: Support both top-level `roles` and `realm_access.roles` + standard OAuth2 `scope` and `azp`.
+   - **Least-Privilege M2M (`client_credentials`)**: Background service-to-service calls use scoped client credentials (`inventory:quota:allocate`, `inventory:read`, etc.) rather than a blanket admin role; `ai-agent-service` strictly uses On-Behalf-Of user JWT propagation.
 
 ## 4. Consequences & Trade-offs
-- **Positive**: Zero shared signing secret risk; zero extra `1 GiB` container overhead during `M2–M5`; gives hands-on mastery of OIDC Discovery, `JWKS` key rotation (`kid`), `Argon2id`, and refresh token rotation while guaranteeing plug-and-play Keycloak compatibility.
-- **Negative / Cost**: Requires implementing `/.well-known/openid-configuration`, `/.well-known/jwks.json`, and dual role-claim mapping (`roles` / `realm_access.roles`).
+- **Positive**: Zero split-horizon container networking failures; zero active-session drops during key rotation; zero application code changes when switching to Keycloak.
+- **Negative / Cost**: Requires maintaining a 2-key JWKS ring (`ACTIVE` + `PREVIOUS`) and scope policies per internal client.
 
 ## 5. Rejected Alternatives
-- **Option A (`HS256` or non-standard JWTs)**: Couples services to custom auth logic and requires refactoring every service when Keycloak is introduced.
+- **Flat `"INTERNAL_SERVICE"` role without scopes**: Rejected in `M0.2` because it violates least privilege across service boundaries.

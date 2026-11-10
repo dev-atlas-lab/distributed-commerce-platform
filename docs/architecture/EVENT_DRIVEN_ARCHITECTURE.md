@@ -46,6 +46,7 @@ For our polyglot stack (`Java 21`, `.NET 10`, `Python 3.12+`), we use a standard
   "source": "order-service",
   "aggregateType": "Order",
   "aggregateId": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+  "aggregateVersion": 1,
   "occurredAt": "2026-11-10T15:45:00.123Z",
   "correlationId": "4bf92f3577b34da6a3ce929d0e0e4736",
   "causationId": "019316a8-7000-7000-8000-111122223333",

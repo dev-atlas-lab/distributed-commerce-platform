@@ -24,7 +24,7 @@ Every persistent store has **exactly one owning service**. No other service may 
 | **`promotion-service`** (.NET) | `promotion_db` | PostgreSQL 17 | `coupon_campaigns`, `coupon_redemptions`, `flash_sale_campaigns`, `flash_sale_items`, `flash_sale_claims`, `outbox_messages`, `inbox_messages` | EF Core Migrations |
 | | `redis` (`db=0`) | Redis 7.4 | `flashsale:{campaignId}:sku:{skuId}:meta`, `flashsale:{campaignId}:sku:{skuId}:stock`, `flashsale:{campaignId}:sku:{skuId}:buyers` | Lua Scripts |
 | **`notification-service`** (.NET) | `notification_db` | PostgreSQL 17 | `notification_dispatches`, `inbox_messages` | EF Core Migrations |
-| **`ai-agent-service`** (Python) | `ai_agent_db` | PostgreSQL 17 + `pgvector` | `knowledge_chunks` (`vector(1536)` / `vector(768)`), `conversation_sessions`, `conversation_messages`, `tool_audit_logs`, `pending_human_approvals` | Alembic |
+| **`ai-agent-service`** (Python) | `ai_agent_db` | PostgreSQL 17 + `pgvector` | `embedding_index_generations`, `knowledge_chunks`, `chunk_embeddings` (multi-dimension `vector` per generation), `conversation_sessions`, `conversation_messages`, `tool_audit_logs`, `pending_human_approvals` | Alembic |
 | **`api-gateway`** (.NET) | `redis` (`db=0`) | Redis 7.4 | `ratelimit:ip:{ip}`, `ratelimit:user:{userId}` | N/A |
 
 ---
@@ -112,9 +112,11 @@ CREATE INDEX idx_orders_awaiting_payment_expiry ON orders (expires_at)
 
 ```sql
 CREATE TABLE outbox_messages (
+    outbox_sequence BIGSERIAL UNIQUE NOT NULL,
     event_id        UUID PRIMARY KEY,
     aggregate_type  VARCHAR(64) NOT NULL,
     aggregate_id    VARCHAR(128) NOT NULL,
+    aggregate_version BIGINT NOT NULL DEFAULT 1,
     event_type      VARCHAR(128) NOT NULL,
     topic           VARCHAR(128) NOT NULL,
     partition_key   VARCHAR(128) NOT NULL,
@@ -127,13 +129,15 @@ CREATE TABLE outbox_messages (
 );
 
 -- Critical partial index so the Outbox Relay never scans already-published rows
-CREATE INDEX idx_outbox_unprocessed ON outbox_messages (created_at ASC)
+CREATE INDEX idx_outbox_unprocessed ON outbox_messages (outbox_sequence ASC)
     WHERE processed_at IS NULL;
 
 CREATE TABLE inbox_messages (
     event_id        UUID NOT NULL,
     consumer_group  VARCHAR(128) NOT NULL,
     event_type      VARCHAR(128) NOT NULL,
+    aggregate_id    VARCHAR(128) NULL,
+    aggregate_version BIGINT NULL,
     processed_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (event_id, consumer_group)
 );

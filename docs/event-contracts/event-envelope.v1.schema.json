@@ -11,6 +11,7 @@
     "source",
     "aggregateType",
     "aggregateId",
+    "aggregateVersion",
     "occurredAt",
     "correlationId",
     "payload"
@@ -28,12 +29,13 @@
         "commerce.order.created.v1",
         "commerce.flashsale.slot_claimed.v1",
         "inventory.stock.reserved.v1",
-        "commerce.payment.succeeded.v1"
+        "commerce.payment.captured.v1"
       ]
     },
     "eventVersion": {
       "type": "integer",
-      "minimum": 1
+      "minimum": 1,
+      "description": "Schema version of the event payload."
     },
     "source": {
       "type": "string",
@@ -52,6 +54,11 @@
     },
     "aggregateId": {
       "type": "string"
+    },
+    "aggregateVersion": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Monotonic version (@Version / RowVersion) of the source aggregate when emitted, used by consumers to detect stale out-of-order events (CH-04)."
     },
     "occurredAt": {
       "type": "string",
