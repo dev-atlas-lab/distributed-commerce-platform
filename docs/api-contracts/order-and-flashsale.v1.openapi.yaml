@@ -1,0 +1,225 @@
+openapi: 3.1.0
+info:
+  title: Distributed Commerce — Order & Flash Sale Core API Contract
+  version: 1.0.0
+  description: >-
+    Canonical OpenAPI 3.1 contract for Standard Order Checkout (Java Order Service)
+    and High-Concurrency Flash Sale Claiming (.NET Promotion Service).
+servers:
+  - url: https://api.commerce.dev-atlas.lab
+    description: API Gateway (.NET 10 YARP)
+paths:
+  /api/v1/orders:
+    post:
+      operationId: createStandardOrder
+      summary: Create a standard e-commerce order and initiate the Order Fulfillment Saga
+      tags: [Orders]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrderRequest'
+      responses:
+        '201':
+          description: Order accepted and Saga initiated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderResponse'
+        '400':
+          $ref: '#/components/responses/ProblemBadRequest'
+        '401':
+          $ref: '#/components/responses/ProblemUnauthorized'
+        '409':
+          $ref: '#/components/responses/ProblemConflict'
+  /api/v1/flash-sales/{campaignId}/claim:
+    post:
+      operationId: claimFlashSaleSlot
+      summary: Attempt to claim a high-demand SKU in an active Flash Sale via the Redis Lua Atomic Gate
+      tags: [FlashSales]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: campaignId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FlashSaleClaimRequest'
+      responses:
+        '202':
+          description: Slot claimed in Redis gate; asynchronous Order & Stock reservation materializing
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FlashSaleClaimResponse'
+        '409':
+          description: Sold out, campaign inactive, or per-customer limit exceeded
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '429':
+          description: Per-user rate limit exceeded
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    CreateOrderRequest:
+      type: object
+      required: [shippingAddressId, items]
+      properties:
+        shippingAddressId:
+          type: string
+          format: uuid
+        couponCode:
+          type: [string, 'null']
+          maxLength: 64
+        items:
+          type: array
+          minItems: 1
+          maxItems: 20
+          items:
+            type: object
+            required: [skuId, quantity]
+            properties:
+              skuId:
+                type: string
+                format: uuid
+              quantity:
+                type: integer
+                minimum: 1
+                maximum: 10
+    OrderResponse:
+      type: object
+      required: [orderId, customerId, status, totalAmount, currency, expiresAt, createdAt]
+      properties:
+        orderId:
+          type: string
+          format: uuid
+        customerId:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [PENDING_RESERVATION, FLASH_SALE_QUEUED, AWAITING_PAYMENT, CONFIRMED, REJECTED, CANCELLED, EXPIRED, FULFILLED, REFUND_PENDING, REFUNDED]
+        subtotalAmount:
+          type: number
+        discountAmount:
+          type: number
+        totalAmount:
+          type: number
+        currency:
+          type: string
+          example: USD
+        expiresAt:
+          type: string
+          format: date-time
+        createdAt:
+          type: string
+          format: date-time
+    FlashSaleClaimRequest:
+      type: object
+      required: [skuId, quantity, shippingAddressId]
+      properties:
+        skuId:
+          type: string
+          format: uuid
+        quantity:
+          type: integer
+          minimum: 1
+          maximum: 2
+        shippingAddressId:
+          type: string
+          format: uuid
+    FlashSaleClaimResponse:
+      type: object
+      required: [claimId, campaignId, skuId, status, reservationToken, pollOrderUrl]
+      properties:
+        claimId:
+          type: string
+          format: uuid
+        campaignId:
+          type: string
+          format: uuid
+        skuId:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [CLAIMED]
+        reservationToken:
+          type: string
+        pollOrderUrl:
+          type: string
+    ProblemDetails:
+      type: object
+      required: [type, title, status, detail, errorCode, traceId, timestamp]
+      properties:
+        type:
+          type: string
+          format: uri
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string
+        errorCode:
+          type: string
+          example: FLASH_SALE_SOLD_OUT
+        traceId:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+  responses:
+    ProblemBadRequest:
+      description: Validation error (RFC 9457 Problem Details)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    ProblemUnauthorized:
+      description: Missing or invalid JWT
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    ProblemConflict:
+      description: Business state conflict (insufficient stock, duplicate state, expired campaign)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'

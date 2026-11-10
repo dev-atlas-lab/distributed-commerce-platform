@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commerce.dev-atlas.lab/schemas/events/event-envelope.v1.schema.json",
+  "title": "StandardIntegrationEventEnvelopeV1",
+  "description": "Mandatory CloudEvents-inspired envelope for all Kafka integration events published via Transactional Outbox.",
+  "type": "object",
+  "required": [
+    "eventId",
+    "eventType",
+    "eventVersion",
+    "source",
+    "aggregateType",
+    "aggregateId",
+    "occurredAt",
+    "correlationId",
+    "payload"
+  ],
+  "properties": {
+    "eventId": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Globally unique UUIDv7/UUIDv4 used for Inbox idempotency deduplication."
+    },
+    "eventType": {
+      "type": "string",
+      "pattern": "^[a-z]+\\.[a-z_]+\\.[a-z_]+\\.v[0-9]+$",
+      "examples": [
+        "commerce.order.created.v1",
+        "commerce.flashsale.slot_claimed.v1",
+        "inventory.stock.reserved.v1",
+        "commerce.payment.succeeded.v1"
+      ]
+    },
+    "eventVersion": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "source": {
+      "type": "string",
+      "enum": [
+        "product-service",
+        "customer-service",
+        "order-service",
+        "inventory-service",
+        "payment-service",
+        "promotion-service",
+        "notification-service"
+      ]
+    },
+    "aggregateType": {
+      "type": "string"
+    },
+    "aggregateId": {
+      "type": "string"
+    },
+    "occurredAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "correlationId": {
+      "type": "string",
+      "description": "End-to-end W3C traceId or request correlation ID."
+    },
+    "causationId": {
+      "type": ["string", "null"],
+      "description": "The eventId or commandId that directly triggered this event."
+    },
+    "payload": {
+      "type": "object"
+    }
+  },
+  "additionalProperties": false
+}
