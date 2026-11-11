@@ -1,0 +1,33 @@
+spring:
+  application:
+    name: catalog-service
+  threads:
+    virtual:
+      enabled: true
+  mvc:
+    problemdetails:
+      enabled: true
+
+server:
+  port: ${SERVER_PORT:8081}
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: never
+
+commerce:
+  environment: ${ENVIRONMENT:development}
+  fault-injection:
+    enabled: ${FAULT_INJECTION_ENABLED:false}
+
+logging:
+  pattern:
+    level: "%5p [${spring.application.name:},%X{traceId:-},%X{spanId:-},%X{correlation_id:-}]"

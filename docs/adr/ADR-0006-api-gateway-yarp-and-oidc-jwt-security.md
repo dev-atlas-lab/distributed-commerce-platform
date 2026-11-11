@@ -1,7 +1,7 @@
 # ADR-0006: `.NET 10` YARP API Gateway, OIDC Identity vs. RFC 9068 OAuth2 Access Tokens & Scoped Service Identity
 
-- **Status:** `ACCEPTED` (`Q5` Standards-Compliant OIDC from Day 1, Keycloak-Ready Accepted in `M0.1`; `CH-05` RFC 9068 Validation & Claim Normalization Approved in Principle, Pending Final Validation in `M0.2.1`)
-- **Date:** 2026-11-10
+- **Status:** `DESIGN_ACCEPTED` (`Q5` Standards-Compliant OIDC from Day 1, Keycloak-Ready Accepted in `M0.1`; `CH-05` RFC 9068 Validation & Claim Normalization Frozen as `DESIGN_ACCEPTED` in `M0.3`)
+- **Date:** 2026-04-11
 - **Deciders:** Human Architect, Solution Architect Agent
 
 ## 1. Context & Problem

@@ -1,7 +1,7 @@
 # ADR-0011: Unified OpenTelemetry & LGTM Observability, Outbox Span Links, Baggage Zero-Trust & Server-Registered Fault Profiles
 
-- **Status:** `ACCEPTED` (Core OpenTelemetry + LGTM Stack Accepted in `M0.1`; `CH-07` Outbox Span Links, Baggage Zero-Trust & Server-Allowlisted Fault Profiles Approved in Principle, Pending Final Validation in `M0.2.1`)
-- **Date:** 2026-11-10
+- **Status:** `DESIGN_ACCEPTED` (Core OpenTelemetry + LGTM Stack Accepted in `M0.1`; `CH-07` Outbox Span Links, Baggage Zero-Trust & Server-Allowlisted Fault Profiles Frozen as `DESIGN_ACCEPTED` in `M0.3`)
+- **Date:** 2026-04-11
 - **Deciders:** Human Architect, Solution Architect Agent
 
 ## 1. Context & Problem

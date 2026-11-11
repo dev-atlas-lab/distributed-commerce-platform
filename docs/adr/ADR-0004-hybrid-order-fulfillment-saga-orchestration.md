@@ -1,7 +1,7 @@
 # ADR-0004: Hybrid Order Fulfillment Saga & Decoupled Order vs. Payment Transition Matrices
 
-- **Status:** `ACCEPTED` (Hybrid Saga Accepted in `M0.1`; `CH-02` Explicit State Transition Matrices `PROPOSED` in `M0.2.1`)
-- **Date:** 2026-11-10
+- **Status:** `DESIGN_ACCEPTED` (Hybrid Saga Accepted in `M0.1`; `CH-02` Explicit State Transition Matrices Frozen as `DESIGN_ACCEPTED` in `M0.3`)
+- **Date:** 2026-04-11
 - **Deciders:** Human Architect, Solution Architect Agent
 
 ## 1. Context & Problem

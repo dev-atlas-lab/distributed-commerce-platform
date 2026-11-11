@@ -1,30 +1,31 @@
-# Architecture Challenge Refinement & Adversarial Verification (`M0.2.5` — `CH-01` through `CH-07`)
+# Architecture Challenge Refinement & Final Freeze (`M0.3` — `CH-01` through `CH-07`)
 
 - **Document ID:** `DCP-DOC-ARCH-008`
+- **Decision Register:** [`DECISION_REGISTER.md`](file:///home/anhltn/projects/distributed-commerce-platform/docs/architecture/DECISION_REGISTER.md)
 - **Verification Reports:** [`M0_2_2_ARCHITECTURE_VERIFICATION_REPORT.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_2_ARCHITECTURE_VERIFICATION_REPORT.md), [`M0_2_3_CONCURRENCY_CORRECTIONS.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_3_CONCURRENCY_CORRECTIONS.md), [`M0_2_4_FINAL_FENCING_REVIEW.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_4_FINAL_FENCING_REVIEW.md), [`M0_2_5_LOCK_AND_KAFKA_OWNERSHIP_REVIEW.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_5_LOCK_AND_KAFKA_OWNERSHIP_REVIEW.md)
 - **Status:**
   - Foundational Decisions (`Q1–Q7`): **`ACCEPTED`**
-  - `CH-01` through `CH-07`: **`PROPOSED` (Adversarially Verified with Formal Proofs in `M0.2.5` — Pending Explicit Human Sign-Off)**
-- **Last Updated:** 2026-11-11
+  - `CH-01` through `CH-07`: **`DESIGN_ACCEPTED` (Frozen in `M0.3` with Simplified `CH-04` Consumer-Boundary Ordering Contract)**
+- **Last Updated:** 2026-04-11
 
 ---
 
-## Executive Overview of `M0.2.2` – `M0.2.5` Adversarial Corrections
+## Executive Overview of `M0.3` Frozen Architecture Decisions
 
-In `M0.2.2` through `M0.2.5`, we performed an adversarial verification of all seven challenge specifications (`CH-01` through `CH-07`) against concurrency races, crash windows, SQL conflict clauses, network partitions, and privilege escalation vectors (`F-01` through `F-18` in [`M0_2_2_ARCHITECTURE_VERIFICATION_REPORT.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_2_ARCHITECTURE_VERIFICATION_REPORT.md), [`M0_2_3_CONCURRENCY_CORRECTIONS.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_3_CONCURRENCY_CORRECTIONS.md), [`M0_2_4_FINAL_FENCING_REVIEW.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_4_FINAL_FENCING_REVIEW.md), and [`M0_2_5_LOCK_AND_KAFKA_OWNERSHIP_REVIEW.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_5_LOCK_AND_KAFKA_OWNERSHIP_REVIEW.md)):
-- **`CH-01` (`M0.2.5` Lock Ordering Proof — `F-11`, `F-12`, `F-15`, `F-17`)**: Replaced multi-CTE joins and lock-acquiring triggers (which risked PostgreSQL `Nested Loop` target-first locking and `Table 2 -> Table 1` AB-BA deadlocks) with **Privilege-Encapsulated `SECURITY DEFINER` PL/pgSQL Stored Procedures (`fn_mp01`–`fn_mp08`)**, **`REVOKE INSERT, UPDATE, DELETE`** on `flash_sale_campaigns`, `flash_sale_claims`, and `flash_sale_items` from `promotion_app_role` (which in PostgreSQL also blocks direct `SELECT ... FOR UPDATE/SHARE` at ACL check time), and **Non-Locking Pre-Lock Witness Triggers (`trg_verify_claims_campaign_prelocked`, `trg_verify_items_campaign_prelocked`)** checking a transaction-local witness variable set in Step 1 (`SQLSTATE P0004`).
-- **`CH-02`**: Removed fabricated `authorized_at = COALESCE(authorized_at, ts)` on direct capture events (`F-04`), separated **provider-reported facts** (`provider_authorized_at`, `provider_captured_at`) from internal state transitions, and added a deterministic `refund_requests` table (`UNIQUE (attempt_id, reason_code)`) for late-capture-after-void auto-refunds (`F-05`).
-- **`CH-03`**: Explicitly analyzed why local `lease_generation` fences **local DB state** while downstream side-effect deduplication relies on passing immutable `downstream_operation_id` (and `lease_generation` for Redis) to the downstream system (`F-06`), and distinguished **Authoritative `NOT_FOUND`** from **Eventually Consistent `NOT_FOUND`** (`MANUAL_INTERVENTION_REQUIRED` escalation).
-- **`CH-04` (`M0.2.5` Kafka Ownership Proof — `F-13`, `F-14`, `F-16`, `F-18`)**: Adopted **Approach C — Generation-Scoped `transactional.id` (`<service>-outbox-shard-<S>-gen-<G>`) + Predecessor Broker Fencing + Post-Init DB Activation CAS**, proven via a pure happens-before linearizability proof ($T_{\text{claim-B}} \prec T_{\text{fence-B}}$ and $T_{\text{init-A}} \prec T_{\text{query-A}}$) with **zero timing, `System.nanoTime()`, or process-kill assumptions**: because `gen-10` and `gen-11` are disjoint `transactional.id`s on the Kafka broker, stale Relay A (`gen-10`) can **never** fence active Relay B (`gen-11`), and in both broker orderings ($T_{\text{init-A}} \prec T_{\text{fence-B}}$ and $T_{\text{fence-B}} \prec T_{\text{init-A}}$), stale Relay A can never publish any event after takeover.
-- **`CH-05`**: Replaced the flat role union (`F-08`) with **Principal-Type Separation** (M2M `client_credentials` tokens can never hold human `CUSTOMER`/`ADMIN_*` roles) and **Target-Service Scoped Role Extraction** (`resource_access[target_service_id].roles`).
-- **`CH-06`**: Removed unverified universal recall/memory claims (`F-09`) and marked `Recall@10` and `p95` latency as **`NEEDS_EVIDENCE` (Empirical Benchmark Targets)** while preserving the verified `pgvector` `2,000d` (`vector`) vs. `4,000d` (`halfvec`) ANN index ceilings.
-- **`CH-07`**: Added a **Fail-Closed Production Startup Guard** (`F-10`): if `ENVIRONMENT == 'production'` (or `PRODUCTION_LOCK == 'true'`) and `FAULT_INJECTION_ENABLED == 'true'`, the service aborts startup immediately with `FatalSecurityConfigurationException`.
+In `M0.3`, the human decision-maker froze `CH-01` through `CH-07` at `DESIGN_ACCEPTED` as the implementation baseline:
+- **`CH-01` (`DESIGN_ACCEPTED` — Least-Privilege `SECURITY DEFINER` Stored Procedures & Canonical Lock Ordering)**: Encapsulates all 8 Promotion mutation paths (`fn_mp01`–`fn_mp08`) in imperative PL/pgSQL `SECURITY DEFINER` stored procedures owned by a dedicated non-login, non-superuser role (`promotion_proc_owner NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE`) with `SET search_path = pg_catalog, public` and explicit `EXECUTE` grants to `promotion_app_role`. Direct `INSERT, UPDATE, DELETE` privileges on protected tables (`flash_sale_campaigns`, `flash_sale_claims`, `flash_sale_items`, `outbox_messages`, `idempotency_records`) are revoked from `promotion_app_role`. Every path locks `flash_sale_campaigns` first (`FOR SHARE` for normal paths, `FOR UPDATE` for Rebuilder), then `flash_sale_claims` (`ORDER BY claim_id ASC`), `flash_sale_items` (`ORDER BY item_id ASC`), `outbox_messages`, and `idempotency_records`. The custom GUC witness (`promotion.locked_campaign_<uuid>`) is documented strictly as an **accidental-bug guard for privileged maintenance scripts/functions** and **not** an independent security boundary.
+- **`CH-02` (`DESIGN_ACCEPTED`)**: Explicit `Order` and `PaymentAttempt` transition matrices, separated provider-reported facts (`provider_authorized_at`, `provider_captured_at`) from internal state transitions, and deterministic `refund_requests` (`UNIQUE (attempt_id, reason_code)`) for late-capture-after-void auto-refunds.
+- **`CH-03` (`DESIGN_ACCEPTED`)**: Class A local DB + outbox atomicity; Class B `lease_generation` fencing + immutable `downstream_operation_id` + `RECONCILING` state + `MANUAL_INTERVENTION_REQUIRED` after `15m` for Type II eventually consistent downstreams.
+- **`CH-04` (`DESIGN_ACCEPTED` — Simplified At-Least-Once Outbox + Consumer-Boundary Ordering)**: Supersedes `HD-04` (generation-scoped Kafka `transactional.id` broker fencing). Uses standard idempotent Kafka producers (`partition_key = aggregate_id`), lowest unpublished `aggregate_version` per aggregate per cycle (`DISTINCT ON (aggregate_id)`), and PostgreSQL shard lease coordination (`outbox_relay_shards`, without claiming that a DB lease fences a running Kafka producer). Strict per-aggregate ordering and state correctness are enforced at the **Consumer Boundary** via atomic `inbox_messages` deduplication and sequential version checks (`incoming.version == last_applied_version + 1`; `<= last_applied_version` is a stale/duplicate no-op; `> last_applied_version + 1` is deferred/retried and never skipped).
+- **`CH-05` (`DESIGN_ACCEPTED`)**: Standards-compliant OIDC + RFC 9068 OAuth2 access token validation, ID token rejection on API calls, principal-type separation (`HUMAN_PRINCIPAL` vs `SERVICE_PRINCIPAL`), and target-service scoped role extraction.
+- **`CH-06` (`DESIGN_ACCEPTED`, Benchmark Targets `NEEDS_EVIDENCE`)**: PostgreSQL 17 FTS initially + `pgvector` with generation isolation (`embedding_index_generations`) and verified `2,000d` (`vector`) vs `4,000d` (`halfvec`) ANN index ceilings; latency and recall targets remain `NEEDS_EVIDENCE`.
+- **`CH-07` (`DESIGN_ACCEPTED`)**: Server-side fault profiles (`fault-profiles.yaml`), strict target allowlists, non-production only, W3C baggage never trusted for auth, mandatory audit logging, and a fail-closed production startup panic.
 
 ---
 
 ## `CH-01`: Redis / PostgreSQL Flash Sale Claim Lifecycle, Lock-Serialized Epoch Fencing & Rebuild
 
-- **Status:** `PROPOSED` (Redesigned & Logically Verified in `M0.2.3` — Pending Final Sign-Off)
+- **Status:** `DESIGN_ACCEPTED` (Frozen in `M0.3` — Least-Privilege `promotion_proc_owner`, Safe `search_path`, Explicit `EXECUTE` Grants, and GUC Witness Clarification)
 - **Related ADR:** [`ADR-0005`](file:///home/anhltn/projects/distributed-commerce-platform/docs/adr/ADR-0005-flash-sale-concurrency-and-three-tier-locking.md)
 - **Detailed Concurrency Report:** [`M0_2_3_CONCURRENCY_CORRECTIONS.md#2-ch-01-redesign`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_3_CONCURRENCY_CORRECTIONS.md)
 
@@ -251,7 +252,7 @@ When `Promotion Service` detects a Redis restart/failover or missing/mismatched 
 
 ## `CH-02`: Orthogonal Order & Payment State Machines (Provider Facts vs. Internal State)
 
-- **Status:** `PROPOSED` (Adversarially Verified in `M0.2.2` — Pending Final Sign-Off)
+- **Status:** `DESIGN_ACCEPTED` (Frozen in `M0.3`)
 - **Related ADR:** [`ADR-0004`](file:///home/anhltn/projects/distributed-commerce-platform/docs/adr/ADR-0004-hybrid-order-fulfillment-saga-orchestration.md)
 
 ### 1. Strict Separation of Provider-Reported Facts vs. Internal State (`F-04` Correction)
@@ -323,7 +324,7 @@ All three mutations (`INSERT INTO payment_webhook_logs`, `UPDATE payment_attempt
 
 ## `CH-03`: Class B Idempotency — Stale Worker Socket Analysis & Authoritative vs. Eventual `NOT_FOUND`
 
-- **Status:** `PROPOSED` (Adversarially Verified in `M0.2.2` — Pending Final Sign-Off)
+- **Status:** `DESIGN_ACCEPTED` (Frozen in `M0.3`)
 - **Related ADR:** [`ADR-0003`](file:///home/anhltn/projects/distributed-commerce-platform/docs/adr/ADR-0003-transactional-outbox-and-inbox-idempotency.md)
 
 ### 1. Adversarial Analysis: Can a Stale Worker Still Invoke an External Provider After Losing Its Lease? (`F-06`)
@@ -361,121 +362,31 @@ When Worker 2 (`lease_generation > 1`) enters `RECONCILING` and queries the down
 
 ---
 
-## `CH-04`: Generation-Scoped `transactional.id` (`Approach C`), Predecessor Broker Fencing & Head-Event Cycle
+## `CH-04`: Simplified At-Least-Once Outbox Relay & Consumer-Boundary Sequential Ordering
 
-- **Status:** `PROPOSED` (Redesigned with Formal Happens-Before Proof in `M0.2.5` — Pending Final Sign-Off)
+- **Status:** `DESIGN_ACCEPTED` (Simplified Contract Frozen in `M0.3`; `HD-04` Generation-Scoped `transactional.id` Broker Fencing `SUPERSEDED`)
 - **Related ADRs:** [`ADR-0003`](file:///home/anhltn/projects/distributed-commerce-platform/docs/adr/ADR-0003-transactional-outbox-and-inbox-idempotency.md), [`ADR-0010`](file:///home/anhltn/projects/distributed-commerce-platform/docs/adr/ADR-0010-event-contracts-json-schema-and-kafka-kraft.md)
-- **Detailed Concurrency Reports:** [`M0_2_5_LOCK_AND_KAFKA_OWNERSHIP_REVIEW.md#3-ch-04`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_5_LOCK_AND_KAFKA_OWNERSHIP_REVIEW.md)
 
-### 1. Eliminating Stale Publishers (`[v1, v2, v1]`), Batch-Crash Replays (`[v1, v2, v1, v2]`), and the Pre-`initTransactions()` Suspension Race (`F-13`, `F-14`, `F-16`, `F-18`)
+### 1. Simplified Outbox & Consumer-Boundary Ordering Contract (`M0.3` Freeze)
 
-As proven in [`M0_2_5_LOCK_AND_KAFKA_OWNERSHIP_REVIEW.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_5_LOCK_AND_KAFKA_OWNERSHIP_REVIEW.md) (**Approach C** — zero reliance on `System.nanoTime()`, `pg_terminate_backend`, or `StatefulSet` split-brain assumptions):
-1. **Generation-Scoped Disjoint `transactional.id` (`<service>-outbox-shard-<S>-gen-<G>`)**:
-   - Every shard lease generation $G$ (`fencing_epoch = G` in `outbox_relay_shards`) uses its own immutable, disjoint Kafka `transactional.id = "<service>-outbox-shard-" + shard_id + "-gen-" + G`.
-   - Because `gen-10` and `gen-11` are distinct `transactional.id`s on the Kafka broker, **a suspended Relay A (`gen-10`) resuming and calling `initTransactions("...-gen-10")` can NEVER fence active Relay B (`"...-gen-11"`)**!
-2. **Predecessor Generation Broker Fencing + Post-Init DB Activation CAS ($T_{\text{claim-B}} \prec T_{\text{fence-B}}$ and $T_{\text{init-A}} \prec T_{\text{query-A}}$)**:
-   - **Step 1 ($T_{\text{claim-B}}$)**: Relay B claims `fencing_epoch = 11, status = 'INITIALIZING'` in PostgreSQL (reading `broker_fenced_up_to_epoch = 9`). Zero outbox rows are read in `INITIALIZING`.
-   - **Step 2 ($T_{\text{fence-B}}$)**: Relay B fences every predecessor generation $e \in (\text{broker\_fenced\_up\_to\_epoch}, 10]$ on the Kafka broker by calling `fencerProducer.initTransactions("...-shard-3-gen-" + e)` and closing it.
-   - **Step 3 ($T_{\text{init-B}}$)**: Relay B calls `txProducerB.initTransactions("...-shard-3-gen-11")`.
-   - **Step 4 ($T_{\text{query}}$ / `ACTIVATE_SHARD_CAS`)**: Only *after* `initTransactions()` returns does a worker execute `UPDATE outbox_relay_shards SET status = 'ACTIVE', broker_fenced_up_to_epoch = :myEpoch - 1 WHERE shard_id = :shardId AND fencing_epoch = :myEpoch AND status = 'INITIALIZING'`.
-   - **Happens-Before Proof**:
-     - If $T_{\text{init-A}} \prec T_{\text{fence-B}}$: Relay B's Step 2 fences `"...-gen-10"` on the Kafka broker (`ProducerFencedException`).
-     - If $T_{\text{fence-B}} \prec T_{\text{init-A}}$ (Relay A was suspended before `initTransactions`): By transitivity $T_{\text{claim-B}} \prec T_{\text{fence-B}} \prec T_{\text{init-A}} \prec T_{\text{query-A}}$, so when Relay A finishes `initTransactions("...-gen-10")` and executes Step 4 (`T_query-A`: `WHERE fencing_epoch = 10`) in PostgreSQL, `fencing_epoch` is already `>= 11`! Relay A gets `0` rows, reads `0` events, and exits without ever touching `"...-gen-11"`.
-3. **Head-of-Aggregate Single-Version-Per-Cycle (`DISTINCT ON (aggregate_id)`)**:
-   - Each `Phase 1` batch claims **at most ONE event (the lowest unpublished `aggregate_version`) per `aggregate_id`** across up to `100` distinct aggregates in that shard (`status = 'ACTIVE'`). Version `v+1` is never sent to Kafka until version `v` is committed in Kafka and marked `processed_at = NOW()` in PostgreSQL.
+In `M0.3`, the previous generation-scoped Kafka `transactional.id` broker-fencing design (`HD-04` from `M0.2.5`) is marked **`SUPERSEDED`** and replaced with a pragmatic, industry-standard division of responsibility between the **Outbox Relay** and the **Consumer Inbox**:
 
-#### 1.1 Updated `outbox_relay_shards` & `outbox_messages` Schema
-```sql
-CREATE TABLE outbox_relay_shards (
-    shard_id                   INTEGER PRIMARY KEY CHECK (shard_id BETWEEN 0 AND 15),
-    status                     VARCHAR(24)  NOT NULL DEFAULT 'IDLE'
-                               CHECK (status IN ('IDLE', 'INITIALIZING', 'ACTIVE')),
-    owner_pod                  VARCHAR(128) NULL,
-    fencing_epoch              BIGINT       NOT NULL DEFAULT 0,
-    broker_fenced_up_to_epoch  BIGINT       NOT NULL DEFAULT 0,
-    lease_until                TIMESTAMPTZ  NOT NULL DEFAULT '-infinity',
-    updated_at                 TIMESTAMPTZ  NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE outbox_messages (
-    outbox_sequence       BIGSERIAL UNIQUE NOT NULL,
-    event_id              UUID PRIMARY KEY,
-    shard_id              INTEGER      NOT NULL CHECK (shard_id BETWEEN 0 AND 15),
-    aggregate_type        VARCHAR(64)  NOT NULL,
-    aggregate_id          VARCHAR(128) NOT NULL,
-    aggregate_version     BIGINT       NOT NULL CHECK (aggregate_version >= 1),
-    event_type            VARCHAR(128) NOT NULL,
-    topic                 VARCHAR(128) NOT NULL,
-    partition_key         VARCHAR(128) NOT NULL,
-    payload               JSONB        NOT NULL,
-    headers               JSONB        NOT NULL,
-    claimed_fencing_epoch BIGINT       NULL,
-    created_at            TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    processed_at          TIMESTAMPTZ  NULL,
-    retry_count           INTEGER      NOT NULL DEFAULT 0,
-    last_error            TEXT         NULL,
-    CONSTRAINT uq_outbox_aggregate_version UNIQUE (aggregate_type, aggregate_id, aggregate_version, event_type)
-);
-
-CREATE INDEX idx_outbox_shard_head
-    ON outbox_messages (shard_id, aggregate_id, aggregate_version ASC, outbox_sequence ASC)
-    WHERE processed_at IS NULL;
-```
-
-#### 1.2 Exact 3-Phase Shard-Fenced Outbox Relay SQL (`status = 'ACTIVE'` Required)
-- **Step 0 (`INITIALIZING -> Predecessor Fence -> initTransactions(gen-G) -> ACTIVE`)**: See full SQL and pseudocode in [`M0_2_5_LOCK_AND_KAFKA_OWNERSHIP_REVIEW.md#342`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_5_LOCK_AND_KAFKA_OWNERSHIP_REVIEW.md).
-- **Phase 1 — Renew `ACTIVE` Lease & Claim Only the Head Event (`DISTINCT ON (aggregate_id)`) Per Aggregate (`< 2ms` TX)**:
-  ```sql
-  WITH renewed_shard AS (
-      UPDATE outbox_relay_shards
-      SET lease_until = NOW() + INTERVAL '30 seconds',
-          updated_at = NOW()
-      WHERE shard_id = :shardId
-        AND status = 'ACTIVE'
-        AND owner_pod = :podId
-        AND fencing_epoch = :myEpoch
-        AND broker_fenced_up_to_epoch = :myEpoch - 1
-        AND lease_until > NOW()
-      RETURNING shard_id, fencing_epoch
-  ),
-  head_per_aggregate AS (
-      SELECT DISTINCT ON (m.aggregate_id)
-             m.event_id, m.aggregate_id, m.aggregate_version, m.outbox_sequence
-      FROM outbox_messages m
-      JOIN renewed_shard rs ON rs.shard_id = m.shard_id
-      WHERE m.processed_at IS NULL
-      ORDER BY m.aggregate_id, m.aggregate_version ASC, m.outbox_sequence ASC
-      LIMIT 100
-  )
-  UPDATE outbox_messages m
-  SET claimed_fencing_epoch = :myEpoch
-  FROM head_per_aggregate h
-  WHERE m.event_id = h.event_id
-  RETURNING m.event_id, m.aggregate_type, m.aggregate_id, m.aggregate_version,
-            m.event_type, m.topic, m.partition_key, m.payload, m.headers, m.claimed_fencing_epoch;
-  ```
-- **Phase 2 — Transactional Kafka Publish (`beginTransaction()` -> `send()` -> `commitTransaction()`)**:
-  - `initTransactions()` is **never** called in Phase 2. Any late packet from a paused prior `ACTIVE` worker is rejected by the Kafka broker with `ProducerFencedException`.
-- **Phase 3 — Short DB Completion Transaction (`< 2ms`)**:
-  ```sql
-  UPDATE outbox_messages m
-  SET processed_at = NOW()
-  FROM outbox_relay_shards s
-  WHERE m.event_id = ANY(:eventIds)
-    AND m.shard_id = s.shard_id
-    AND s.shard_id = :shardId
-    AND s.status = 'ACTIVE'
-    AND s.owner_pod = :podId
-    AND s.fencing_epoch = :myEpoch;
-  ```
-- **Defense-in-Depth Consumer Contract**:
-  - Consumers configure `isolation.level = read_committed`, deduplicate `event_id` in `inbox_messages (event_id, consumer_group)`, ignore `incoming.aggregate_version <= aggregate.last_applied_version` as an idempotent no-op, apply `== last_applied_version + 1`, and route `> last_applied_version + 1` to `.retry` (`SEQUENCE_GAP_DETECTED`).
+1. **Explicit Distinction of Ordering Guarantees**:
+   - **Kafka Delivery Order (`At-Least-Once`, Best-Effort Partition Order)**: Standard idempotent Kafka producers (`enable.idempotence=true`, `acks=all`) publish messages with `partition_key = aggregate_id`.
+   - **PostgreSQL Lease Coordination (`outbox_relay_shards`)**: Relay workers coordinate shard ownership via `outbox_relay_shards (shard_id, owner_pod, fencing_epoch, lease_until)` to minimize duplicate polling. **We explicitly do NOT claim that a PostgreSQL lease fences an already-running paused Kafka producer at the broker.** If a relay worker pauses past `lease_until`, duplicate delivery or a temporary version inversion (`v+1` arriving before `v`) on the Kafka partition is tolerated.
+   - **Consumer Application Order (`Strictly Sequential per Aggregate`)**: Consumers enforce atomic `inbox_messages (event_id, consumer_group)` deduplication and strict version continuity (`incoming.aggregate_version == aggregate.last_applied_version + 1`) inside a single local database transaction:
+     - `incoming.aggregate_version <= last_applied_version`: Duplicate or stale delivery -> **idempotent no-op** (acknowledged and ignored).
+     - `incoming.aggregate_version == last_applied_version + 1`: Next expected version -> **applied atomically** and `last_applied_version` incremented.
+     - `incoming.aggregate_version > last_applied_version + 1`: Out-of-order version gap -> **buffered/deferred for bounded retry** (`SEQUENCE_GAP_DETECTED`); **never applied early and never skipped**.
+   - **Aggregate State Correctness (`Deterministic`)**: Because the consumer boundary enforces exact sequential application (`v = 1, 2, 3...`), downstream aggregate state and Saga transitions are 100% deterministic without requiring broker-level generation fencing.
+2. **Head-of-Aggregate Single-Version-Per-Cycle (`DISTINCT ON (aggregate_id)`)**:
+   - Each relay polling cycle selects at most **one** event (the lowest unpublished `aggregate_version`) per `aggregate_id` (`SELECT DISTINCT ON (aggregate_id) ... WHERE processed_at IS NULL ORDER BY aggregate_id, aggregate_version ASC, outbox_sequence ASC LIMIT 100`), publishes to Kafka with `key = aggregate_id`, and marks `processed_at = NOW()` where `processed_at IS NULL`.
 
 ---
 
 ## `CH-05`: OIDC / RFC 9068 Access Token Validation & Privilege Escalation Prevention
 
-- **Status:** `PROPOSED` (Adversarially Verified in `M0.2.2` — Pending Final Sign-Off)
+- **Status:** `DESIGN_ACCEPTED` (Frozen in `M0.3`)
 - **Related ADR:** [`ADR-0006`](file:///home/anhltn/projects/distributed-commerce-platform/docs/adr/ADR-0006-api-gateway-yarp-and-oidc-jwt-security.md)
 
 ### 1. Eliminating Cross-Service Role Union Privilege Escalation (`F-08` Fix)
@@ -503,7 +414,7 @@ In `M0.2.1`, we wrote `roles = union(jwt.roles, jwt.realm_access.roles, jwt.reso
 
 ## `CH-06`: `pgvector` Storage vs. ANN Index Limits & Benchmark Target Classification
 
-- **Status:** `PROPOSED` (Adversarially Verified in `M0.2.2` — Pending Final Sign-Off)
+- **Status:** `DESIGN_ACCEPTED` (Frozen in `M0.3`; Benchmark Targets `NEEDS_EVIDENCE`)
 - **Related ADR:** [`ADR-0008`](file:///home/anhltn/projects/distributed-commerce-platform/docs/adr/ADR-0008-ai-agent-security-boundary-and-pgvector-rag.md)
 
 ### 1. Verified `pgvector` Physical Limits vs. Empirical Benchmark Targets (`F-09` Fix)
@@ -520,7 +431,7 @@ In `M0.2.1`, we wrote `roles = union(jwt.roles, jwt.realm_access.roles, jwt.reso
 
 ## `CH-07`: Observability Trace Continuity & Fail-Closed Production Fault Injection Guard
 
-- **Status:** `PROPOSED` (Adversarially Verified in `M0.2.2` — Pending Final Sign-Off)
+- **Status:** `DESIGN_ACCEPTED` (Frozen in `M0.3`)
 - **Related ADR:** [`ADR-0011`](file:///home/anhltn/projects/distributed-commerce-platform/docs/adr/ADR-0011-observability-opentelemetry-and-lgtm-stack.md)
 
 ### 1. Fail-Closed Production Startup & Triple-Gated Fault Injection (`F-10` Fix)
@@ -552,14 +463,12 @@ To guarantee that fault injection fails closed even if an operator misconfigures
 | `SPEC-CH01-T3` | `CH-01` | Hold `SELECT ... FROM flash_sale_campaigns WHERE campaign_id = :id AND current_epoch = 1 FOR SHARE` open for `6s` while starting `TX_REBUILDER_FENCE_AND_SNAPSHOT`. | `idle_in_transaction_session_timeout = 3s` / `Step R0` (`pg_terminate_backend`) terminates the stalled backend, `TX_REBUILDER` bumps `current_epoch = 2`, and any late single-CTE Writer carrying `redisClaimEpoch = 1` matches `0` rows in `campaign_guard` and aborts. |
 | `SPEC-CH01-T4` | `CH-01` | Expire claim `C1` in `epoch = 1` (`release_epoch = 1`), run `TX_REBUILDER_FENCE_AND_SNAPSHOT` (`current_epoch = 2`), and invoke `flash_sale_release.lua` with `ARGV[3] = 1`. | Redis Lua returns `-2` (`STALE_EPOCH`) and does not increment `epoch = 2` stock above `allocated_quota - claimed_count`. |
 | `SPEC-CH01-T5` | `CH-01` | Attempt (a) `UPDATE flash_sale_claims SET stock_returned_to_redis = TRUE` with stale `release_epoch < current_epoch`, (b) `UPDATE flash_sale_claims SET status = 'ORDER_MATERIALIZED'` during `REBUILDING_GATE`, and (c) `UPDATE flash_sale_items` during `REBUILDING_GATE`. | All three mutations are blocked by `fn_mp04`/`fn_mp05`/`fn_mp06` and rejected (`SQLSTATE P0001`). |
-| `SPEC-CH01-T6` | `CH-01` | Connect as `promotion_app_role` and attempt direct `SELECT * FROM flash_sale_claims FOR UPDATE` or `UPDATE flash_sale_claims`; connect as `promotion_schema_owner` and attempt direct `UPDATE flash_sale_claims` without setting `promotion.locked_campaign_<uuid>`. | `promotion_app_role` fails with `SQLSTATE 42501 (permission denied)`; `promotion_schema_owner` fails with `SQLSTATE P0004 (LOCK_ORDER_VIOLATION)` from `trg_verify_claims_campaign_prelocked` with zero reverse lock wait edges. |
+| `SPEC-CH01-T6` | `CH-01` | Connect as `promotion_app_role` and attempt direct `SELECT * FROM flash_sale_claims FOR UPDATE` or `UPDATE flash_sale_claims`; connect as `promotion_proc_owner` and attempt direct `UPDATE flash_sale_claims` without setting `promotion.locked_campaign_<uuid>`. | `promotion_app_role` fails with `SQLSTATE 42501 (permission denied)`; `promotion_proc_owner` accidental direct query fails with `SQLSTATE P0004 (LOCK_ORDER_VIOLATION)` from `trg_verify_claims_campaign_prelocked` (accidental-bug guard). |
 | `SPEC-CH02-T1` | `CH-02` | Send direct `webhook: payment.captured` to `INITIATED` `PaymentAttempt`. | `status` becomes `CAPTURED`, `provider_captured_at` is set, and `provider_authorized_at` remains `NULL` (not fabricated). |
 | `SPEC-CH02-T2` | `CH-02` | Transition `PaymentAttempt` to `VOIDED`, then deliver two duplicate `payment.captured` webhooks (`W1`, `W2`). | Attempt transitions to `REFUND_PENDING`, `refund_requests` inserts `1` row (`UNIQUE (attempt_id, reason_code)`), and gateway refund is invoked **once**. |
 | `SPEC-CH03-T1` | `CH-03` | Simulate Worker 1 (`lease_gen = 1`) freezing before external call, Worker 2 (`lease_gen = 2`) completing via `RECONCILING`, and Worker 1 waking up to send its external call and update DB. | Downstream deduplicates on `downstream_operation_id`; Worker 1's local DB update (`WHERE lease_generation = 1`) updates `0` rows. |
-| `SPEC-CH04-T1` | `CH-04` | Insert 10 sequential events (`v=1..10`) for `orderId = O1` while running 4 concurrent Outbox Relay threads using the `outbox_relay_shards` + `DISTINCT ON (aggregate_id)` query. | Each cycle claims only the lowest unpublished `aggregate_version` for `O1`; consumer receives strict `[1..10]` order. |
-| `SPEC-CH04-T2` | `CH-04` | Relay A (`shard_id = 3`, `gen = 10`) begins a Kafka transaction (`transactional.id = "...-shard-3-gen-10"`), sends `O1:v1`, and pauses before `commitTransaction()`. Relay B steals `shard_id = 3` (`gen = 11`), fences `"...-gen-10"`, inits `"...-gen-11"`, and publishes `O1:v1` and `O1:v2`. Resume Relay A and call `commitTransaction()`. | Kafka broker rejects Relay A with `ProducerFencedException`; `READ_COMMITTED` consumer receives strictly `[O1:v1, O1:v2]`. |
-| `SPEC-CH04-T3` | `CH-04` | Insert `O1:v1` and `O1:v2` into `outbox_messages`. Crash Relay A immediately after `commitTransaction()` for `O1:v1` before Phase 3 updates PostgreSQL. Run Relay B for 2 cycles. | `O1:v2` was never sent by Relay A; Relay B publishes `O1:v1` in Cycle 1 and `O1:v2` in Cycle 2 (`[v1, v1, v2]` in Kafka), and Consumer Inbox applies `v1` once and `v2` once. |
-| `SPEC-CH04-T4` / `T5` | `CH-04` | Relay A acquires `fencing_epoch = 10` (`status = 'INITIALIZING'`, `txId = "...-shard-3-gen-10"`) and is suspended immediately before `txProducerA.initTransactions()`. Lease expires; Relay B acquires `fencing_epoch = 11`, fences `"...-gen-10"`, inits `"...-gen-11"`, activates (`status = 'ACTIVE'`), and publishes `O1:v1`. Resume Relay A so `txProducerA.initTransactions("...-gen-10")` executes. | (1) Relay B (`"...-gen-11"`) is **never fenced** (disjoint `transactional.id`) and publishes `O1:v2` uninterrupted; (2) Relay A fails Step 4 `ACTIVATE_SHARD_CAS` (`0` rows updated because `fencing_epoch = 11 != 10`), reads `0` events, and publishes `0` messages. |
+| `SPEC-CH04-T1` | `CH-04` | Insert 10 sequential events (`v=1..10`) for `orderId = O1` while running Outbox Relay threads using `DISTINCT ON (aggregate_id)`. | Each cycle claims only the lowest unpublished `aggregate_version` for `O1` with `partition_key = aggregate_id`. |
+| `SPEC-CH04-T2` | `CH-04` | Deliver duplicate (`v=1`), out-of-order gap (`v=3`), and expected next (`v=2`) events for `O1` (`last_applied_version = 1`) to the Consumer Inbox. | `v=1` is ignored as an idempotent no-op, `v=3` is deferred (`SEQUENCE_GAP_DETECTED`), `v=2` is applied advancing `last_applied_version = 2`, and `v=3` is subsequently applied advancing `last_applied_version = 3`. |
 | `SPEC-CH05-T1` | `CH-05` | Mint an M2M `client_credentials` token that maliciously includes `"roles": ["CUSTOMER", "ADMIN_OPS"]` in its payload, and call `POST /api/v1/orders` and `/api/v1/admin/products`. | Auth middleware classifies token as `SERVICE_PRINCIPAL`, strips human roles, and rejects both calls with `403 Forbidden`. |
 | `SPEC-CH06-T1` | `CH-06` | Attempt `INSERT INTO embedding_index_generations (dimensions=3072, index_storage_type='VECTOR_FP32')` vs `index_storage_type='HALFVEC_FP16'`. | `VECTOR_FP32` at `3072d` is rejected by PostgreSQL `CHECK` constraint; `HALFVEC_FP16` succeeds and builds `USING hnsw ((embedding::halfvec(3072)) halfvec_cosine_ops)`. |
 | `SPEC-CH07-T1` | `CH-07` | Start service with `ENVIRONMENT=production` and `FAULT_INJECTION_ENABLED=true`. | Process aborts startup immediately with `FatalSecurityConfigurationException` (`exitCode != 0`). |

@@ -2,9 +2,9 @@
 
 - **Repository:** `dev-atlas-lab/distributed-commerce-platform`
 - **Organization:** [dev-atlas-lab](https://github.com/dev-atlas-lab)
-- **Milestone:** `M0.2.5 — Lock Ordering and Kafka Ownership Proof (CH-01 & CH-04)`
-- **Status:** `ACCEPTED` (Core Decisions `Q1–Q7` Accepted; `CH-01`–`CH-07` Adversarially Verified with Formal Proofs in [`M0_2_2_ARCHITECTURE_VERIFICATION_REPORT.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_2_ARCHITECTURE_VERIFICATION_REPORT.md), [`M0_2_3_CONCURRENCY_CORRECTIONS.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_3_CONCURRENCY_CORRECTIONS.md), [`M0_2_4_FINAL_FENCING_REVIEW.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_4_FINAL_FENCING_REVIEW.md), and [`M0_2_5_LOCK_AND_KAFKA_OWNERSHIP_REVIEW.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_5_LOCK_AND_KAFKA_OWNERSHIP_REVIEW.md) — Pending Final Sign-Off)
-- **Last Updated:** 2026-11-11
+- **Milestone:** `M0.3 — Architecture Freeze and Source Foundation`
+- **Status:** `DESIGN_ACCEPTED` (Foundational Decisions `Q1–Q7` `ACCEPTED`; Architecture Challenges `CH-01`–`CH-07` Frozen at `DESIGN_ACCEPTED` in [`docs/architecture/DECISION_REGISTER.md`](file:///home/anhltn/projects/distributed-commerce-platform/docs/architecture/DECISION_REGISTER.md); Requirements & Acceptance Criteria Frozen in [`docs/requirements/`](file:///home/anhltn/projects/distributed-commerce-platform/docs/requirements/); Polyglot Source Foundation Scaffolded & Verified)
+- **Last Updated:** 2026-04-11
 
 ---
 
@@ -46,9 +46,14 @@ distributed-commerce-platform/
 ├── docs/
 │   ├── product/
 │   │   └── PRODUCT_REQUIREMENTS.md
+│   ├── requirements/
+│   │   ├── REQUIREMENTS.md
+│   │   ├── NON_FUNCTIONAL_REQUIREMENTS.md
+│   │   └── ACCEPTANCE_CRITERIA.md
 │   ├── domain/
 │   │   └── DOMAIN_MODEL.md
 │   ├── architecture/
+│   │   ├── DECISION_REGISTER.md
 │   │   ├── ARCHITECTURE_CHALLENGE_M0_1.md
 │   │   ├── SYSTEM_ARCHITECTURE.md
 │   │   ├── SERVICE_BOUNDARIES.md
@@ -57,6 +62,8 @@ distributed-commerce-platform/
 │   │   ├── AI_AGENT_ARCHITECTURE.md
 │   │   ├── DEPLOYMENT_ARCHITECTURE.md
 │   │   └── TEST_STRATEGY.md
+│   ├── development/
+│   │   └── LOCAL_DEVELOPMENT.md
 │   ├── api-contracts/
 │   │   ├── README.md
 │   │   └── order-and-flashsale.v1.openapi.yaml
@@ -87,14 +94,34 @@ distributed-commerce-platform/
 │   │   └── REPOSITORY_BOOTSTRAP_REPORT.md
 │   ├── runbooks/
 │   └── engineering-case-studies/
-├── frontend/                     # (Scaffolded in M1) React 19 + TS Storefront & Admin UI
-├── services/
-│   ├── java/                     # (Scaffolded in M1) Product, Order, Inventory, Payment
-│   ├── dotnet/                   # (Scaffolded in M1) Gateway, Customer, Promotion, Notification
-│   └── python/                   # (Scaffolded in M1) AI Agent Service
-├── infrastructure/               # (Scaffolded in M1/M6) Postgres, Redis, Kafka, K8s, Helm, ArgoCD, OTel
-├── tests/                        # (Scaffolded in M1–M7) Contract, E2E, Performance (k6), Chaos, Security
-├── scripts/                      # (Scaffolded in M1) Toolchain setup, infra verification, CI runner
+├── src/
+│   ├── gateways/
+│   │   └── api-gateway/          # .NET 10 + YARP Edge Gateway
+│   ├── services/
+│   │   ├── catalog/              # Java 21 + Spring Boot 3.4 Catalog Service
+│   │   ├── inventory/            # Java 21 + Spring Boot 3.4 Inventory Service
+│   │   ├── order/                # Java 21 + Spring Boot 3.4 Order & Saga Service
+│   │   ├── payment/              # Java 21 + Spring Boot 3.4 Payment Service
+│   │   ├── customer/             # .NET 10 Customer & Identity Service
+│   │   ├── promotion/            # .NET 10 Promotion & Flash Sale Service
+│   │   └── notification/         # .NET 10 Notification Service
+│   ├── workers/
+│   │   └── ai-worker/            # Python 3.12+ FastAPI AI Shopping & Ops Worker
+│   └── building-blocks/
+│       ├── java/                 # Shared Java 21 cross-cutting foundation (commerce-common)
+│       ├── dotnet/               # Shared .NET 10 cross-cutting foundation (Commerce.BuildingBlocks)
+│       └── python/               # Shared Python 3.12+ cross-cutting foundation (commerce-common)
+├── deploy/
+│   ├── local/                    # Local Docker Compose & multi-DB initialization
+│   ├── kubernetes/               # Standard CNCF K3s/kubeadm manifests & Helm charts
+│   └── observability/            # OpenTelemetry, Prometheus, Grafana, Loki, Tempo configs
+├── tests/
+│   ├── architecture/             # Boundary & dependency enforcement tests
+│   ├── integration/              # Testcontainers DB/Redis/Kafka integration suites
+│   ├── contract/                 # OpenAPI 3.1 & JSON Schema contract tests
+│   ├── performance/              # k6 load & Flash Sale benchmark suites
+│   └── security/                 # OIDC/JWT & DB privilege verification suites
+├── scripts/                      # Build, test, and local environment helper scripts
 └── .agents/                      # Antigravity workspace rules, workflows & templates
 ```
 

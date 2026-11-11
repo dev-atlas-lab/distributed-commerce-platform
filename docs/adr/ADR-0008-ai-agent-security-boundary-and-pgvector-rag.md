@@ -1,7 +1,7 @@
 # ADR-0008: Multi-Provider AI Abstraction, `pgvector` Physical Index Limits (`vector` vs. `halfvec`) & Generation Isolation
 
-- **Status:** `ACCEPTED` (`Q7` Multi-Provider AI Abstraction & Zero-Privilege Boundary Accepted in `M0.1`; `CH-06` `pgvector` Physical Index Ceiling & Generation Isolation Corrections `PROPOSED` in `M0.2.1`)
-- **Date:** 2026-11-10
+- **Status:** `DESIGN_ACCEPTED` (`Q7` Multi-Provider AI Abstraction & Zero-Privilege Boundary Accepted in `M0.1`; `CH-06` `pgvector` Physical Index Ceiling & Generation Isolation Frozen as `DESIGN_ACCEPTED` in `M0.3`, Performance Targets `NEEDS_EVIDENCE`)
+- **Date:** 2026-04-11
 - **Deciders:** Human Architect, Solution Architect Agent
 
 ## 1. Context & Problem

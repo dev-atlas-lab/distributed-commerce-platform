@@ -1,6 +1,6 @@
 # Distributed Commerce & Flash Sale Platform
 
-[![Status: M0 Proposed](https://img.shields.io/badge/Milestone-M0_Architecture_In_Review-blue)](#)
+[![Status: M0.3 Architecture Frozen & Source Foundation Ready](https://img.shields.io/badge/Milestone-M0.3_Architecture_Frozen_%26_Foundation_Ready-success)](#)
 [![Java 21](https://img.shields.io/badge/Java-21_LTS_%7C_Spring_Boot_3.4-orange)](#)
 [![.NET 10](https://img.shields.io/badge/.NET-10_LTS_%7C_ASP.NET_Core-purple)](#)
 [![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B_%7C_FastAPI_AI_Agent-green)](#)
@@ -28,11 +28,14 @@ A production-oriented polyglot distributed e-commerce and high-concurrency **Fla
 
 ---
 
-## 2. Core Engineering Documentation (`Milestone M0`)
+## 2. Core Engineering Documentation (`Milestone M0.3 — Architecture Freeze & Source Foundation`)
 
 - **Governance & Constitution**: [`PROJECT_CONSTITUTION.md`](file:///home/anhltn/projects/distributed-commerce-platform/PROJECT_CONSTITUTION.md) | [`AGENTS.md`](file:///home/anhltn/projects/distributed-commerce-platform/AGENTS.md)
 - **Master Technical Specification**: [`SPEC.md`](file:///home/anhltn/projects/distributed-commerce-platform/SPEC.md)
-- **M0.2.2 Adversarial Architecture Verification Report**: [`M0_2_2_ARCHITECTURE_VERIFICATION_REPORT.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_2_ARCHITECTURE_VERIFICATION_REPORT.md)
+- **Architecture Decision Register (`Q1–Q7`, `CH-01–CH-07`, `HD-01–HD-04`)**: [`docs/architecture/DECISION_REGISTER.md`](file:///home/anhltn/projects/distributed-commerce-platform/docs/architecture/DECISION_REGISTER.md)
+- **Consolidated Requirements & Acceptance Criteria**: [`docs/requirements/REQUIREMENTS.md`](file:///home/anhltn/projects/distributed-commerce-platform/docs/requirements/REQUIREMENTS.md) | [`docs/requirements/NON_FUNCTIONAL_REQUIREMENTS.md`](file:///home/anhltn/projects/distributed-commerce-platform/docs/requirements/NON_FUNCTIONAL_REQUIREMENTS.md) | [`docs/requirements/ACCEPTANCE_CRITERIA.md`](file:///home/anhltn/projects/distributed-commerce-platform/docs/requirements/ACCEPTANCE_CRITERIA.md)
+- **Local Development Guide**: [`docs/development/LOCAL_DEVELOPMENT.md`](file:///home/anhltn/projects/distributed-commerce-platform/docs/development/LOCAL_DEVELOPMENT.md)
+- **M0.2.2–M0.2.5 Adversarial Architecture Verification Reports**: [`M0_2_2_ARCHITECTURE_VERIFICATION_REPORT.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_2_ARCHITECTURE_VERIFICATION_REPORT.md) | [`M0_2_3_CONCURRENCY_CORRECTIONS.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_3_CONCURRENCY_CORRECTIONS.md) | [`M0_2_4_FINAL_FENCING_REVIEW.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_4_FINAL_FENCING_REVIEW.md) | [`M0_2_5_LOCK_AND_KAFKA_OWNERSHIP_REVIEW.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_5_LOCK_AND_KAFKA_OWNERSHIP_REVIEW.md)
 - **Product Requirements (PRD)**: [`docs/product/PRODUCT_REQUIREMENTS.md`](file:///home/anhltn/projects/distributed-commerce-platform/docs/product/PRODUCT_REQUIREMENTS.md)
 - **Domain-Driven Design Model**: [`docs/domain/DOMAIN_MODEL.md`](file:///home/anhltn/projects/distributed-commerce-platform/docs/domain/DOMAIN_MODEL.md)
 - **System Architecture & 21 Pattern Evaluations**: [`docs/architecture/SYSTEM_ARCHITECTURE.md`](file:///home/anhltn/projects/distributed-commerce-platform/docs/architecture/SYSTEM_ARCHITECTURE.md)
