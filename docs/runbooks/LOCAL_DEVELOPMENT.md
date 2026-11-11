@@ -61,7 +61,19 @@ Executes readiness checks, 8-database isolation & `NOSUPERUSER` assertions, `pro
 ./scripts/verify-local-infra.sh
 ```
 
-### 4.3 Run Polyglot Source Foundation Build & Tests
+### 4.3 Run Versioned Database Migrations Across All 8 Databases (`M1.2`)
+Executes versioned SQL migrations (`V001__*.sql`, `V002__*.sql`) across all 8 service databases using each database's dedicated `<service>_migrator` role, tracking history and verifying `SHA-256` immutability in `public.schema_migration_history`:
+```bash
+./scripts/run-migrations.sh
+```
+
+### 4.4 Run Promotion Security & Clean-Bootstrap Verification (`M1.2`)
+Executes the 85-check PostgreSQL security and `fn_mp01`–`fn_mp08` verification suite (`./tests/security/test-promotion-db-security.sh`) against both the running `commerce-postgres` container and a disposable clean-bootstrap container (`commerce-postgres-clean-test:15432`) without deleting your existing local development volume:
+```bash
+./scripts/verify-m1-2-db-security.sh
+```
+
+### 4.5 Run Polyglot Source Foundation Build & Tests
 ```bash
 ./scripts/verify-foundation.sh
 ```
