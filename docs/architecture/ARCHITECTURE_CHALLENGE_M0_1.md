@@ -1,52 +1,56 @@
-# Architecture Challenge Refinement & Adversarial Verification (`M0.2.2` — `CH-01` through `CH-07`)
+# Architecture Challenge Refinement & Adversarial Verification (`M0.2.3` — `CH-01` through `CH-07`)
 
 - **Document ID:** `DCP-DOC-ARCH-008`
-- **Verification Report:** [`M0_2_2_ARCHITECTURE_VERIFICATION_REPORT.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_2_ARCHITECTURE_VERIFICATION_REPORT.md)
+- **Verification Reports:** [`M0_2_2_ARCHITECTURE_VERIFICATION_REPORT.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_2_ARCHITECTURE_VERIFICATION_REPORT.md), [`M0_2_3_CONCURRENCY_CORRECTIONS.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_3_CONCURRENCY_CORRECTIONS.md)
 - **Status:**
   - Foundational Decisions (`Q1–Q7`): **`ACCEPTED`**
-  - `CH-01` through `CH-07`: **`PROPOSED` (Adversarially Verified in `M0.2.2` — Pending Explicit Human Sign-Off)**
+  - `CH-01` through `CH-07`: **`PROPOSED` (Adversarially Verified & Concurrency-Hardened in `M0.2.3` — Pending Explicit Human Sign-Off)**
 - **Last Updated:** 2026-11-11
 
 ---
 
-## Executive Overview of `M0.2.2` Adversarial Corrections
+## Executive Overview of `M0.2.2` & `M0.2.3` Adversarial Corrections
 
-In `M0.2.2`, we performed an adversarial verification of all seven challenge specifications (`CH-01` through `CH-07`) against concurrency races, crash windows, SQL conflict clauses, network partitions, and privilege escalation vectors. Ten subtle contradictions (`F-01` through `F-10` in [`M0_2_2_ARCHITECTURE_VERIFICATION_REPORT.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_2_ARCHITECTURE_VERIFICATION_REPORT.md)) were uncovered and corrected below:
-- **`CH-01`**: Unified Writer & Reconciler SQL (`INSERT ... ON CONFLICT (claim_id) DO NOTHING RETURNING status` + fallback `SELECT status`), added a PostgreSQL `stock_returned_to_redis = FALSE -> TRUE` atomic pre-condition before calling `flash_sale_release.lua` (preventing double-restock even if Redis `released_claims` expires or is lost), and added **`campaign_epoch` fencing** during `REBUILDING_GATE` Redis AOF recovery.
+In `M0.2.2` and `M0.2.3`, we performed an adversarial verification of all seven challenge specifications (`CH-01` through `CH-07`) against concurrency races, crash windows, SQL conflict clauses, network partitions, and privilege escalation vectors (`F-01` through `F-14` in [`M0_2_2_ARCHITECTURE_VERIFICATION_REPORT.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_2_ARCHITECTURE_VERIFICATION_REPORT.md) and [`M0_2_3_CONCURRENCY_CORRECTIONS.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_3_CONCURRENCY_CORRECTIONS.md)):
+- **`CH-01` (`M0.2.3` Final Concurrency Correction — `F-11`, `F-12`)**: Replaced the lock-free `SELECT current_epoch` and `5.5s` fixed sleep with a **Lock-Serialized `FOR SHARE` / `FOR UPDATE` Epoch Barrier on `flash_sale_campaigns` + Single-Statement Data-Modifying CTEs + `release_epoch` Validation in `flash_sale_release.lua` + `3s` `idle_in_transaction_session_timeout` + Active Zombie Termination (`pg_terminate_backend`)**. Because `TX_WRITER`, `TX_RECONCILER`, and `TX_EXPIRE_OR_CANCEL` acquire `FOR SHARE` on `flash_sale_campaigns` while `TX_REBUILDER` acquires conflicting `FOR UPDATE`, it is mathematically impossible for any old-epoch transaction to remain open or commit after the rebuild snapshot boundary.
 - **`CH-02`**: Removed fabricated `authorized_at = COALESCE(authorized_at, ts)` on direct capture events (`F-04`), separated **provider-reported facts** (`provider_authorized_at`, `provider_captured_at`) from internal state transitions, and added a deterministic `refund_requests` table (`UNIQUE (attempt_id, reason_code)`) for late-capture-after-void auto-refunds (`F-05`).
 - **`CH-03`**: Explicitly analyzed why local `lease_generation` fences **local DB state** while downstream side-effect deduplication relies on passing immutable `downstream_operation_id` (and `lease_generation` for Redis) to the downstream system (`F-06`), and distinguished **Authoritative `NOT_FOUND`** from **Eventually Consistent `NOT_FOUND`** (`MANUAL_INTERVENTION_REQUIRED` escalation).
-- **`CH-04`**: Replaced long-held PostgreSQL `FOR UPDATE` row locks across Kafka network I/O (`F-07`) with a **3-Phase Lease-Claimed Outbox Relay** (`<2ms` Phase 1 DB claim with `pg_try_advisory_xact_lock(hashtext(aggregate_id))`, lock-free Phase 2 Kafka publish, `<2ms` Phase 3 DB completion), and proved crash safety before/after Kafka publish.
+- **`CH-04` (`M0.2.3` Final Concurrency Correction — `F-13`, `F-14`)**: Upgraded the 3-Phase Outbox Relay with **Shard-Scoped Single-Writer Leases (`outbox_relay_shards`) + Deterministic Kafka `transactional.id` Broker-Enforced `ProducerEpoch` Fencing + Head-of-Aggregate Single-Version-Per-Cycle (`DISTINCT ON (aggregate_id)`)**. When Relay B reclaims an expired shard lease, it calls `producer.initTransactions()` for `transactional.id = "<service>-outbox-shard-" + shard_id` *before* querying or publishing any rows—fencing paused Relay A at the Kafka broker (`ProducerFencedException`)—and `v+1` is never sent to Kafka until `v` is marked `processed_at = NOW()` in PostgreSQL.
 - **`CH-05`**: Replaced the flat role union (`F-08`) with **Principal-Type Separation** (M2M `client_credentials` tokens can never hold human `CUSTOMER`/`ADMIN_*` roles) and **Target-Service Scoped Role Extraction** (`resource_access[target_service_id].roles`).
 - **`CH-06`**: Removed unverified universal recall/memory claims (`F-09`) and marked `Recall@10` and `p95` latency as **`NEEDS_EVIDENCE` (Empirical Benchmark Targets)** while preserving the verified `pgvector` `2,000d` (`vector`) vs. `4,000d` (`halfvec`) ANN index ceilings.
 - **`CH-07`**: Added a **Fail-Closed Production Startup Guard** (`F-10`): if `ENVIRONMENT == 'production'` (or `PRODUCTION_LOCK == 'true'`) and `FAULT_INJECTION_ENABLED == 'true'`, the service aborts startup immediately with `FatalSecurityConfigurationException`.
 
 ---
 
-## `CH-01`: Redis / PostgreSQL Flash Sale Claim Lifecycle, Fenced Reconciliation & Epoch Recovery
+## `CH-01`: Redis / PostgreSQL Flash Sale Claim Lifecycle, Lock-Serialized Epoch Fencing & Rebuild
 
-- **Status:** `PROPOSED` (Adversarially Verified in `M0.2.2` — Pending Final Sign-Off)
+- **Status:** `PROPOSED` (Redesigned & Logically Verified in `M0.2.3` — Pending Final Sign-Off)
 - **Related ADR:** [`ADR-0005`](file:///home/anhltn/projects/distributed-commerce-platform/docs/adr/ADR-0005-flash-sale-concurrency-and-three-tier-locking.md)
+- **Detailed Concurrency Report:** [`M0_2_3_CONCURRENCY_CORRECTIONS.md#2-ch-01-redesign`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_3_CONCURRENCY_CORRECTIONS.md)
 
-### 1. Exact SQL Statements & Single-Transaction Boundary (`promotion_db`)
+### 1. Strict Lock Acquisition Order & Single-Statement CTE Mutations (`promotion_db`)
+
+To prevent deadlocks and guarantee that **no old-epoch transaction can ever commit after `TX_REBUILDER` begins reading the authoritative snapshot** (without relying on any fixed sleep timer), every Flash Sale transaction acquires locks in strict topological order:
+$$\text{1. } \texttt{flash\_sale\_campaigns} \longrightarrow \text{2. } \texttt{flash\_sale\_claims} \longrightarrow \text{3. } \texttt{flash\_sale\_items} \longrightarrow \text{4. } \texttt{outbox\_messages} \longrightarrow \text{5. } \texttt{idempotency\_records}$$
 
 ```mermaid
 stateDiagram-v2
     [*] --> REDIS_INTENT_LEASED : Step 1 - Redis Lua EVALSHA (claim_id, campaign_epoch, TTL=30s)
-    REDIS_INTENT_LEASED --> CLAIMED_RESERVED : Step 2 - Single DB TX (epoch check + flash_sale_claims + outbox + idempotency)
-    REDIS_INTENT_LEASED --> ABANDONED_FENCED : Reconciler TX (lease > 30s) inserts ABANDONED_FENCED -> stock_returned_to_redis -> Redis release
+    REDIS_INTENT_LEASED --> CLAIMED_RESERVED : Step 2 - Single-CTE DB TX (FOR SHARE campaign_guard + claims + items + outbox + idem)
+    REDIS_INTENT_LEASED --> ABANDONED_FENCED : Reconciler Single-CTE TX (FOR SHARE campaign_guard + ABANDONED_FENCED + release_epoch)
     CLAIMED_RESERVED --> ORDER_MATERIALIZED : Order Service materializes FlashSaleOrder
-    CLAIMED_RESERVED --> EXPIRED : Payment window (10m) expires -> stock_returned_to_redis -> Redis release
-    CLAIMED_RESERVED --> CANCELLED : Customer cancels -> stock_returned_to_redis -> Redis release
+    CLAIMED_RESERVED --> EXPIRED : Payment window (10m) expires -> FOR SHARE campaign_guard -> release_epoch -> Redis release
+    CLAIMED_RESERVED --> CANCELLED : Customer cancels -> FOR SHARE campaign_guard -> release_epoch -> Redis release
     ORDER_MATERIALIZED --> PAYMENT_CONFIRMED : PaymentCaptured event processed
-    ORDER_MATERIALIZED --> EXPIRED : Order payment expires -> stock_returned_to_redis -> Redis release
-    ORDER_MATERIALIZED --> CANCELLED : Order cancelled -> stock_returned_to_redis -> Redis release
+    ORDER_MATERIALIZED --> EXPIRED : Order payment expires -> FOR SHARE campaign_guard -> release_epoch -> Redis release
+    ORDER_MATERIALIZED --> CANCELLED : Order cancelled -> FOR SHARE campaign_guard -> release_epoch -> Redis release
     PAYMENT_CONFIRMED --> [*]
     EXPIRED --> [*]
     CANCELLED --> [*]
     ABANDONED_FENCED --> [*]
 ```
 
-#### 1.1 Schema (`flash_sale_campaigns` & `flash_sale_claims`)
+#### 1.1 Schema & Engine-Level Epoch Fencing Trigger (`flash_sale_campaigns` & `flash_sale_claims`)
 ```sql
 CREATE TABLE flash_sale_campaigns (
     campaign_id             UUID PRIMARY KEY,
@@ -57,13 +61,15 @@ CREATE TABLE flash_sale_campaigns (
                             )),
     current_epoch           BIGINT       NOT NULL DEFAULT 1,
     starts_at               TIMESTAMPTZ  NOT NULL,
-    ends_at                 TIMESTAMPTZ  NOT NULL
+    ends_at                 TIMESTAMPTZ  NOT NULL,
+    updated_at              TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE flash_sale_claims (
     claim_id                UUID PRIMARY KEY,
     campaign_id             UUID NOT NULL REFERENCES flash_sale_campaigns(campaign_id),
     campaign_epoch          BIGINT NOT NULL,
+    release_epoch           BIGINT NULL,
     sku_id                  UUID NOT NULL,
     customer_id             UUID NOT NULL,
     idempotency_key         VARCHAR(128) NOT NULL,
@@ -88,102 +94,160 @@ CREATE TABLE flash_sale_claims (
 CREATE UNIQUE INDEX uq_flash_active_customer_sku
     ON flash_sale_claims (campaign_id, sku_id, customer_id)
     WHERE status IN ('CLAIMED_RESERVED', 'ORDER_MATERIALIZED', 'PAYMENT_CONFIRMED');
+
+-- Defense-in-depth trigger: enforces FOR SHARE lock on flash_sale_campaigns + ACTIVE status + matching epoch
+CREATE OR REPLACE FUNCTION fn_enforce_campaign_epoch_and_lock()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE
+    v_current_epoch BIGINT;
+    v_status        VARCHAR(32);
+BEGIN
+    SELECT current_epoch, status
+      INTO v_current_epoch, v_status
+      FROM flash_sale_campaigns
+     WHERE campaign_id = NEW.campaign_id
+       FOR SHARE;
+
+    IF NOT FOUND OR v_status <> 'ACTIVE' THEN
+        RAISE EXCEPTION 'CAMPAIGN_NOT_ACTIVE_FENCED: campaign=% status=%', NEW.campaign_id, v_status
+            USING ERRCODE = 'P0001';
+    END IF;
+
+    IF TG_OP = 'INSERT' AND NEW.campaign_epoch <> v_current_epoch THEN
+        RAISE EXCEPTION 'STALE_CAMPAIGN_EPOCH_FENCED: claim_epoch=% current_epoch=%',
+            NEW.campaign_epoch, v_current_epoch
+            USING ERRCODE = 'P0002';
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_enforce_campaign_epoch_and_lock
+BEFORE INSERT OR UPDATE OF status ON flash_sale_claims
+FOR EACH ROW
+WHEN (NEW.status IN ('CLAIMED_RESERVED', 'ABANDONED_FENCED', 'EXPIRED', 'CANCELLED')
+      AND (TG_OP = 'INSERT' OR OLD.status IS DISTINCT FROM NEW.status))
+EXECUTE FUNCTION fn_enforce_campaign_epoch_and_lock();
 ```
 
-#### 1.2 Exact SQL for Original / Retrying Writer (`TX_WRITER`)
-All four statements execute inside a **single local PostgreSQL transaction (`READ COMMITTED`, `statement_timeout = '5s'`)**:
+#### 1.2 Exact Single-Statement Data-Modifying CTE for Writer (`TX_WRITER`)
+All five steps execute inside **one single-roundtrip SQL statement** (with session timeouts `statement_timeout = '3s'`, `idle_in_transaction_session_timeout = '3s'`, `lock_timeout = '2s'`), eliminating any possibility of a client JVM/.NET pause between statements while holding an open transaction:
 ```sql
-BEGIN;
-
--- Step W1: Verify campaign is in the expected epoch (fences pre-Redis-crash in-flight claims!)
-SELECT current_epoch FROM flash_sale_campaigns
-WHERE campaign_id = :campaignId AND current_epoch = :redisClaimEpoch;
--- (If 0 rows returned -> ROLLBACK and return 503 REBUILDING_GATE)
-
--- Step W2: Attempt to insert CLAIMED_RESERVED (or detect existing row if Reconciler/Retry beat us)
-INSERT INTO flash_sale_claims (
-    claim_id, campaign_id, campaign_epoch, sku_id, customer_id, idempotency_key,
-    quantity, status, intent_lease_expires_at, payment_expires_at
-) VALUES (
-    :claimId, :campaignId, :redisClaimEpoch, :skuId, :customerId, :idempotencyKey,
-    :qty, 'CLAIMED_RESERVED', :intentExpiresAt, :paymentExpiresAt
+WITH
+campaign_guard AS (
+    SELECT campaign_id, current_epoch
+    FROM flash_sale_campaigns
+    WHERE campaign_id = :campaignId
+      AND current_epoch = :redisClaimEpoch
+      AND status = 'ACTIVE'
+    FOR SHARE
+),
+inserted_claim AS (
+    INSERT INTO flash_sale_claims (
+        claim_id, campaign_id, campaign_epoch, sku_id, customer_id, idempotency_key,
+        quantity, status, intent_lease_expires_at, payment_expires_at
+    )
+    SELECT
+        :claimId, cg.campaign_id, cg.current_epoch, :skuId, :customerId, :idempotencyKey,
+        :qty, 'CLAIMED_RESERVED', :intentExpiresAt, :paymentExpiresAt
+    FROM campaign_guard cg
+    ON CONFLICT (claim_id) DO NOTHING
+    RETURNING claim_id, campaign_id, sku_id, quantity, status
+),
+updated_item AS (
+    UPDATE flash_sale_items fsi
+    SET claimed_count = fsi.claimed_count + ic.quantity
+    FROM inserted_claim ic
+    WHERE fsi.campaign_id = ic.campaign_id
+      AND fsi.sku_id = ic.sku_id
+      AND fsi.claimed_count + ic.quantity <= fsi.allocated_quota
+    RETURNING fsi.sku_id
+),
+inserted_outbox AS (
+    INSERT INTO outbox_messages (
+        event_id, shard_id, aggregate_type, aggregate_id, aggregate_version,
+        event_type, topic, partition_key, payload, headers
+    )
+    SELECT
+        :eventId, mod(abs(hashtext(:customerId::text)), 16), 'FlashSaleClaim', ic.claim_id::text, 1,
+        'commerce.flashsale.slot_claimed.v1', 'commerce.flashsale.events.v1',
+        :customerId::text, :payloadJsonb, :headersJsonb
+    FROM inserted_claim ic
+    JOIN updated_item ui ON ui.sku_id = ic.sku_id
+    RETURNING event_id
+),
+completed_idem AS (
+    UPDATE idempotency_records
+    SET status = 'COMPLETED_SUCCESS', http_status_code = 202,
+        response_payload = :responseJsonb, updated_at = NOW()
+    WHERE scope_owner_id = :customerId
+      AND endpoint_id = 'POST:/api/v1/flash-sales/claim'
+      AND idempotency_key = :idempotencyKey
+      AND lease_generation = :expectedLeaseGen
+      AND EXISTS (SELECT 1 FROM inserted_outbox)
+    RETURNING idempotency_key
 )
-ON CONFLICT (claim_id) DO NOTHING
-RETURNING status;
-
--- Step W3: Branch on Step W2 result:
---   Case W3-A (1 row returned with status = 'CLAIMED_RESERVED'):
---     Proceed to Step W4 (first-time commit!).
---   Case W3-B (0 rows returned because claim_id already exists):
---     Execute: SELECT status FROM flash_sale_claims WHERE claim_id = :claimId;
---     • If existing status == 'ABANDONED_FENCED' (Reconciler won the race!):
---         ROLLBACK immediately and return 409 Conflict (CLAIM_LEASE_EXPIRED_FENCED).
---     • If existing status IN ('CLAIMED_RESERVED', 'ORDER_MATERIALIZED', 'PAYMENT_CONFIRMED'):
---         COMMIT idempotently (a prior retry already committed Steps W2–W5) and return 202 Accepted!
-
--- Step W4: Increment item claimed_count (only executed on Case W3-A first-time insert)
-UPDATE flash_sale_items
-SET claimed_count = claimed_count + :qty
-WHERE campaign_id = :campaignId AND sku_id = :skuId
-  AND claimed_count + :qty <= allocated_quota;
--- (If 0 rows updated -> ROLLBACK!)
-
--- Step W5: Insert Outbox Event + Complete Idempotency Record (same transaction!)
-INSERT INTO outbox_messages (
-    event_id, aggregate_type, aggregate_id, aggregate_version,
-    event_type, topic, partition_key, payload, headers
-) VALUES (
-    :eventId, 'FlashSaleClaim', :claimId::text, 1,
-    'commerce.flashsale.slot_claimed.v1', 'commerce.flashsale.events.v1',
-    :customerId::text, :payloadJsonb, :headersJsonb
-);
-
-UPDATE idempotency_records
-SET status = 'COMPLETED_SUCCESS', http_status_code = 202,
-    response_payload = :responseJsonb, updated_at = NOW()
-WHERE scope_owner_id = :customerId
-  AND endpoint_id = 'POST:/api/v1/flash-sales/claim'
-  AND idempotency_key = :idempotencyKey
-  AND lease_generation = :expectedLeaseGen;
-
-COMMIT;
+SELECT
+    (SELECT COUNT(*) FROM campaign_guard) AS epoch_valid,
+    (SELECT status FROM inserted_claim) AS inserted_status,
+    (SELECT COUNT(*) FROM updated_item) AS quota_updated,
+    (SELECT status FROM flash_sale_claims WHERE claim_id = :claimId) AS existing_status;
 ```
 
-#### 1.3 Exact SQL for Reconciler Tombstone Fence (`TX_RECONCILER`) & Post-TTL Safe Restock
-When an unacknowledged Redis intent lease expires (`now > intent_lease_expires_at`):
+#### 1.3 Exact Single-Statement CTE for Reconciler (`TX_RECONCILER`) & Epoch-Checked `flash_sale_release.lua`
 ```sql
--- TX_RECONCILER_1: Fence the claim_id in PostgreSQL FIRST
-BEGIN;
-INSERT INTO flash_sale_claims (
-    claim_id, campaign_id, campaign_epoch, sku_id, customer_id, idempotency_key,
-    quantity, status, intent_lease_expires_at, payment_expires_at, stock_returned_to_redis
-) VALUES (
-    :claimId, :campaignId, :epoch, :skuId, :customerId, :idempotencyKey,
-    :qty, 'ABANDONED_FENCED', :intentExpiresAt, :intentExpiresAt, FALSE
+WITH campaign_guard AS (
+    SELECT campaign_id, current_epoch
+    FROM flash_sale_campaigns
+    WHERE campaign_id = :campaignId
+      AND current_epoch = :redisClaimEpoch
+      AND status = 'ACTIVE'
+    FOR SHARE
+),
+fenced_claim AS (
+    INSERT INTO flash_sale_claims (
+        claim_id, campaign_id, campaign_epoch, release_epoch, sku_id, customer_id,
+        idempotency_key, quantity, status, intent_lease_expires_at, payment_expires_at,
+        stock_returned_to_redis
+    )
+    SELECT
+        :claimId, cg.campaign_id, cg.current_epoch, cg.current_epoch, :skuId, :customerId,
+        :idempotencyKey, :qty, 'ABANDONED_FENCED', :intentExpiresAt, :intentExpiresAt,
+        FALSE
+    FROM campaign_guard cg
+    ON CONFLICT (claim_id) DO NOTHING
+    RETURNING claim_id, status, release_epoch
 )
-ON CONFLICT (claim_id) DO NOTHING
-RETURNING status;
-COMMIT;
+SELECT
+    (SELECT COUNT(*) FROM campaign_guard) AS epoch_valid,
+    (SELECT status FROM fenced_claim) AS fenced_status,
+    (SELECT release_epoch FROM fenced_claim) AS release_epoch,
+    (SELECT status FROM flash_sale_claims WHERE claim_id = :claimId) AS existing_status;
 ```
-- **Why Duplicate Release Can NEVER Double-Restock Even After Redis Marker Expiration (`F-02` Proof)**:
-  - Whether a claim is released due to `ABANDONED_FENCED`, `EXPIRED`, or `CANCELLED`, the worker must acquire the **PostgreSQL Restock Authorization Token** before calling `flash_sale_release.lua`:
-    1. First, verify `SELECT status, stock_returned_to_redis FROM flash_sale_claims WHERE claim_id = :claimId` shows `status IN ('ABANDONED_FENCED', 'EXPIRED', 'CANCELLED')` and `stock_returned_to_redis == FALSE`.
-    2. Execute `EVALSHA flash_sale_release.lua` in Redis (which checks `HSETNX released_claims {claimId}` in Redis memory).
-    3. Immediately mark `UPDATE flash_sale_claims SET stock_returned_to_redis = TRUE, updated_at = NOW() WHERE claim_id = :claimId AND stock_returned_to_redis = FALSE`.
-    - Even if a Kafka message replays `48 hours` later after Redis `released_claims` TTL has expired, Step 1 sees `stock_returned_to_redis == TRUE` in PostgreSQL (and the campaign is `ENDED`/`RECONCILED`), so `flash_sale_release.lua` is **never called a second time**!
+- **Why Cross-Epoch Releases Cannot Inflate Stock (`F-12` Proof)**:
+  - Every `ABANDONED_FENCED`, `EXPIRED`, or `CANCELLED` mutation records `release_epoch = current_epoch` while holding `FOR SHARE` on `flash_sale_campaigns`.
+  - `flash_sale_release.lua` validates `tonumber(redis.call('HGET', KEYS[1], 'epoch')) == tonumber(ARGV[3])` (`release_epoch`) and clamps `new_stock = math.min(allocated_quota, current_stock + add_qty)`.
+  - If a Redis rebuild (`TX_REBUILDER_FENCE_AND_SNAPSHOT`) occurs first and advances `current_epoch` to `E + 1`, the Rebuilder's snapshot (`allocated_quota - SUM(active_claims)`) **already restores all freed stock from epochs `<= E`** and marks all `stock_returned_to_redis = FALSE` rows as `TRUE` inside the same `FOR UPDATE` transaction! Any in-flight RPC calling `flash_sale_release.lua` with `release_epoch = E < E + 1` is rejected by Redis Lua (`return -2`).
 
-### 2. Redis AOF Data Loss Simulation & `REBUILDING_GATE` Epoch Recovery (`F-03` Proof)
-Suppose at $T = 100.0\text{s}$, `10` users pass `flash_sale_claim.lua` in Redis (`epoch = 1`, stock decremented from `500 -> 490`), and at $T = 100.2\text{s}$ (before Redis `appendfsync everysec` flushes to disk and before those `10` threads reach PostgreSQL), the Redis container/VM suffers a hard power reset:
-1. Redis restarts with stale AOF state from $T = 99.5\text{s}$ (`stock = 500`, missing the `10` in-flight claims!).
-2. `Promotion Service` detects either a missing script/epoch key or `redis_epoch != db_current_epoch`:
-   - **Step R1 (Epoch Fence in PostgreSQL)**: `UPDATE flash_sale_campaigns SET status = 'REBUILDING_GATE', current_epoch = current_epoch + 1 WHERE campaign_id = :id RETURNING current_epoch` (`new_epoch = 2`).
-   - **What happens to those 10 in-flight threads from `epoch = 1` when they hit PostgreSQL at $T = 100.4\text{s}$?** Their `Step W1` query (`WHERE campaign_id = :id AND current_epoch = 1`) matches **`0` rows**! All 10 pre-crash in-flight threads deterministically **abort and roll back** (`503 Retry-After: 5`).
-   - **Step R2 (Wait for In-Flight DB TX Drain)**: Wait `5.5 seconds` (`> 5s` PostgreSQL `statement_timeout`) so zero `epoch = 1` transactions can still be open in PostgreSQL.
-   - **Step R3 (Exact State Reconstruction from PostgreSQL)**:
-     - Query `SELECT COALESCE(SUM(quantity), 0) AS committed_qty FROM flash_sale_claims WHERE campaign_id = :id AND status IN ('CLAIMED_RESERVED', 'ORDER_MATERIALIZED', 'PAYMENT_CONFIRMED')`.
-     - Write `stock = allocated_quota - committed_qty`, active `buyers` map, and `epoch = 2` into Redis.
-     - Flip campaign back to `ACTIVE` (`epoch = 2`).
-   - **Result**: **Zero leaked stock and zero oversold units**, even when Redis loses `1 second` of un-fsynced AOF writes!
+### 2. Sleep-Free `REBUILDING_GATE` Exclusive Lock & Zombie Termination Protocol (`F-11` Fix)
+When `Promotion Service` detects a Redis restart/failover or missing/mismatched epoch:
+1. **Step R0 (Active Zombie Backend Termination)**: Terminate any stalled backend holding a lock on `flash_sale_campaigns` for `> 3 seconds`:
+   ```sql
+   SELECT pg_terminate_backend(l.pid)
+   FROM pg_locks l
+   JOIN pg_stat_activity a ON a.pid = l.pid
+   WHERE l.relation = 'flash_sale_campaigns'::regclass
+     AND l.granted = TRUE
+     AND a.pid <> pg_backend_pid()
+     AND (NOW() - a.xact_start) > INTERVAL '3 seconds';
+   ```
+2. **Step R1 (`TX_REBUILDER_FENCE_AND_SNAPSHOT` — Exclusive `FOR UPDATE` Lock + Snapshot in One DB TX)**:
+   - Execute `UPDATE flash_sale_campaigns SET status = 'REBUILDING_GATE', current_epoch = current_epoch + 1 WHERE campaign_id = :id RETURNING current_epoch`.
+   - Because `UPDATE` acquires an exclusive `FOR UPDATE` lock on `flash_sale_campaigns` that conflicts with `FOR SHARE`, PostgreSQL's lock manager **blocks Step R1 until 100% of open `TX_WRITER`, `TX_RECONCILER`, and `TX_EXPIRE_OR_CANCEL` transactions holding `FOR SHARE` have committed or rolled back**, and blocks any new `FOR SHARE` locker until Step R1 commits!
+   - Inside the **same transaction**, mark all prior `EXPIRED`/`CANCELLED`/`ABANDONED_FENCED` rows (`stock_returned_to_redis = TRUE`), reconcile `flash_sale_items.claimed_count`, and read the authoritative `remaining_stock` and active `buyers` map.
+3. **Step R2 & R3 (Redis Reconstruction & Activation)**:
+   - Write the snapshot and `epoch = :newEpoch` into Redis while `status = 'REBUILDING_GATE'` prevents any DB mutations, then flip Redis and `flash_sale_campaigns.status` back to `'ACTIVE'`.
 
 ---
 
@@ -299,103 +363,109 @@ When Worker 2 (`lease_generation > 1`) enters `RECONCILING` and queries the down
 
 ---
 
-## `CH-04`: 3-Phase Lease-Claimed Outbox Relay (Zero DB Locks Held Across Network I/O)
+## `CH-04`: Shard-Fenced Outbox Relay with Broker `ProducerEpoch` Fencing & Head-Event Cycle
 
-- **Status:** `PROPOSED` (Adversarially Verified in `M0.2.2` — Pending Final Sign-Off)
+- **Status:** `PROPOSED` (Redesigned & Logically Verified in `M0.2.3` — Pending Final Sign-Off)
 - **Related ADRs:** [`ADR-0003`](file:///home/anhltn/projects/distributed-commerce-platform/docs/adr/ADR-0003-transactional-outbox-and-inbox-idempotency.md), [`ADR-0010`](file:///home/anhltn/projects/distributed-commerce-platform/docs/adr/ADR-0010-event-contracts-json-schema-and-kafka-kraft.md)
+- **Detailed Concurrency Report:** [`M0_2_3_CONCURRENCY_CORRECTIONS.md#3-ch-04-redesign`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_3_CONCURRENCY_CORRECTIONS.md)
 
-### 1. Eliminating Long-Held Row Locks During Kafka Network Publish (`F-07` Fix)
-Holding `SELECT ... FOR UPDATE` locks open while waiting for `kafkaProducer.send().get()` ties up HikariCP/Npgsql connections if a Kafka broker leader election takes `3–5 seconds`. We replace single-transaction locking with a **3-Phase Lease-Claimed Outbox Relay** where database locks are held for **`< 2 milliseconds`**:
+### 1. Eliminating Both Stale Publishers (`[v1, v2, v1]`) and Batch-Crash Replays (`[v1, v2, v1, v2]`) (`F-13` & `F-14` Fixes)
 
-#### 1.1 Updated `outbox_messages` Schema
+A database lease alone cannot physically stop a GC-paused Relay A from flushing a TCP socket to Kafka after Relay B has taken over and published `v1` and `v2`, nor does standard per-instance `enable.idempotence = true` fence a different producer instance. Furthermore, if a single cycle publishes multiple versions (`[v1, v2]`) of the same aggregate before updating PostgreSQL, a crash after Kafka commit before DB update causes the recovery worker to re-publish `[v1, v2]`, placing `v1` after `v2`.
+
+We resolve both failure modes at the **actual Kafka broker boundary** and **cycle claim boundary**:
+1. **Deterministic Shard Assignment (`shard_id = mod(abs(hashtext(partition_key)), 16)`) & `outbox_relay_shards` Lease Table**:
+   - Each service partitions outbox rows into 16 logical shards (`0..15`), each owned by a single active Relay worker with a monotonic `fencing_epoch`.
+2. **Broker-Level Producer Fencing via Deterministic Kafka `transactional.id` (`ProducerEpoch`)**:
+   - Each `shard_id` binds to a deterministic Kafka `transactional.id = "<service-name>-outbox-shard-" + shard_id`.
+   - Whenever Relay B acquires or steals an expired lease for `shard_id` (`fencing_epoch > broker_fenced_epoch`), Relay B **MUST** call `txProducer.initTransactions()` **before querying or publishing any rows**.
+   - The Kafka Transaction Coordinator increments `ProducerEpoch` on the broker, aborts any open transaction from paused Relay A, and causes the broker to **reject any resumed `ProduceRequest` or `commitTransaction()` from Relay A with `ProducerFencedException` (`INVALID_PRODUCER_EPOCH`)**. All consumers configure `isolation.level = read_committed`.
+3. **Head-of-Aggregate Single-Version-Per-Cycle (`DISTINCT ON (aggregate_id)`)**:
+   - Each Phase 1 batch claims **at most ONE event (the lowest unpublished `aggregate_version`) per `aggregate_id`** across up to `100` distinct aggregates in that shard.
+   - Version `v2` of aggregate `O1` is **never sent to Kafka** until version `v1` is committed in Kafka **AND** marked `processed_at = NOW()` in PostgreSQL! Thus a crash between Phase 2 and Phase 3 can only repeat the head version (`[v1, v1, v2]`), never invert order (`[v1, v2, v1]`).
+
+#### 1.1 Updated `outbox_relay_shards` & `outbox_messages` Schema
 ```sql
+CREATE TABLE outbox_relay_shards (
+    shard_id            INTEGER PRIMARY KEY CHECK (shard_id BETWEEN 0 AND 15),
+    owner_pod           VARCHAR(128) NULL,
+    fencing_epoch       BIGINT       NOT NULL DEFAULT 0,
+    broker_fenced_epoch BIGINT       NOT NULL DEFAULT 0,
+    lease_until         TIMESTAMPTZ  NOT NULL DEFAULT '-infinity',
+    updated_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE outbox_messages (
-    outbox_sequence     BIGSERIAL UNIQUE NOT NULL,
-    event_id            UUID PRIMARY KEY,
-    aggregate_type      VARCHAR(64)  NOT NULL,
-    aggregate_id        VARCHAR(128) NOT NULL,
-    aggregate_version   BIGINT       NOT NULL CHECK (aggregate_version >= 1),
-    event_type          VARCHAR(128) NOT NULL,
-    topic               VARCHAR(128) NOT NULL,
-    partition_key       VARCHAR(128) NOT NULL,
-    payload             JSONB        NOT NULL,
-    headers             JSONB        NOT NULL,
-    relay_status        VARCHAR(20)  NOT NULL DEFAULT 'PENDING'
-                        CHECK (relay_status IN ('PENDING', 'PUBLISHING', 'PUBLISHED')),
-    relay_owner         VARCHAR(128) NULL,
-    relay_lease_until   TIMESTAMPTZ  NULL,
-    created_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    processed_at        TIMESTAMPTZ  NULL,
-    retry_count         INTEGER      NOT NULL DEFAULT 0,
-    last_error          TEXT         NULL,
+    outbox_sequence       BIGSERIAL UNIQUE NOT NULL,
+    event_id              UUID PRIMARY KEY,
+    shard_id              INTEGER      NOT NULL CHECK (shard_id BETWEEN 0 AND 15),
+    aggregate_type        VARCHAR(64)  NOT NULL,
+    aggregate_id          VARCHAR(128) NOT NULL,
+    aggregate_version     BIGINT       NOT NULL CHECK (aggregate_version >= 1),
+    event_type            VARCHAR(128) NOT NULL,
+    topic                 VARCHAR(128) NOT NULL,
+    partition_key         VARCHAR(128) NOT NULL,
+    payload               JSONB        NOT NULL,
+    headers               JSONB        NOT NULL,
+    claimed_fencing_epoch BIGINT       NULL,
+    created_at            TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    processed_at          TIMESTAMPTZ  NULL,
+    retry_count           INTEGER      NOT NULL DEFAULT 0,
+    last_error            TEXT         NULL,
     CONSTRAINT uq_outbox_aggregate_version UNIQUE (aggregate_type, aggregate_id, aggregate_version, event_type)
 );
 
-CREATE INDEX idx_outbox_unprocessed
-    ON outbox_messages (outbox_sequence ASC)
-    WHERE processed_at IS NULL;
-
-CREATE INDEX idx_outbox_aggregate_pending
-    ON outbox_messages (aggregate_id, aggregate_version ASC, outbox_sequence ASC)
+CREATE INDEX idx_outbox_shard_head
+    ON outbox_messages (shard_id, aggregate_id, aggregate_version ASC, outbox_sequence ASC)
     WHERE processed_at IS NULL;
 ```
 
-#### 1.2 Exact 3-Phase Outbox Relay Protocol
-- **Phase 1 — Short DB Claim Transaction (`< 2ms`, Commits Before Any Network I/O)**:
+#### 1.2 Exact 3-Phase Shard-Fenced Outbox Relay SQL
+- **Step 0 — Acquire/Renew Shard Lease & Broker `initTransactions()` Fencing**:
+  - Acquire/renew `shard_id` in `outbox_relay_shards`. If `fencing_epoch > broker_fenced_epoch`, call `txProducer.initTransactions()` for `transactional.id = "<service>-outbox-shard-" + shard_id` (fencing any paused producer on the Kafka broker) and set `broker_fenced_epoch = fencing_epoch`.
+- **Phase 1 — Claim Only the Head Event (`DISTINCT ON (aggregate_id)`) Per Aggregate (`< 2ms` TX)**:
   ```sql
-  BEGIN;
-  -- 1. Find up to 25 distinct aggregate_ids that have unpublished rows
-  --    AND have NO active 'PUBLISHING' lease held by another pod right now,
-  --    acquiring a transaction-level advisory lock per aggregate_id:
-  WITH candidate_aggregates AS (
-      SELECT DISTINCT ON (o1.aggregate_id) o1.aggregate_id, o1.outbox_sequence
-      FROM outbox_messages o1
-      WHERE o1.processed_at IS NULL
-        AND (o1.relay_status = 'PENDING' OR o1.relay_lease_until <= NOW())
-        AND NOT EXISTS (
-            SELECT 1 FROM outbox_messages o2
-            WHERE o2.aggregate_id = o1.aggregate_id
-              AND o2.processed_at IS NULL
-              AND o2.relay_status = 'PUBLISHING'
-              AND o2.relay_lease_until > NOW()
-        )
-        AND pg_try_advisory_xact_lock(hashtext(o1.aggregate_id))
-      ORDER BY o1.aggregate_id, o1.outbox_sequence ASC
-      LIMIT 25
+  WITH shard_guard AS (
+      SELECT shard_id, fencing_epoch
+      FROM outbox_relay_shards
+      WHERE shard_id = :shardId
+        AND owner_pod = :podId
+        AND fencing_epoch = :fencingEpoch
+        AND broker_fenced_epoch = :fencingEpoch
+        AND lease_until > NOW() + INTERVAL '5 seconds'
+      FOR SHARE
+  ),
+  head_per_aggregate AS (
+      SELECT DISTINCT ON (m.aggregate_id)
+             m.event_id, m.aggregate_id, m.aggregate_version, m.outbox_sequence
+      FROM outbox_messages m
+      JOIN shard_guard sg ON sg.shard_id = m.shard_id
+      WHERE m.processed_at IS NULL
+      ORDER BY m.aggregate_id, m.aggregate_version ASC, m.outbox_sequence ASC
+      LIMIT 100
   )
   UPDATE outbox_messages m
-  SET relay_status = 'PUBLISHING',
-      relay_owner = :podId,
-      relay_lease_until = NOW() + INTERVAL '30 seconds'
-  FROM candidate_aggregates ca
-  WHERE m.aggregate_id = ca.aggregate_id
-    AND m.processed_at IS NULL
-  RETURNING m.outbox_sequence, m.event_id, m.aggregate_id, m.aggregate_version,
-            m.event_type, m.topic, m.partition_key, m.payload, m.headers;
-  COMMIT;
+  SET claimed_fencing_epoch = :fencingEpoch
+  FROM head_per_aggregate h
+  WHERE m.event_id = h.event_id
+  RETURNING m.event_id, m.aggregate_type, m.aggregate_id, m.aggregate_version,
+            m.event_type, m.topic, m.partition_key, m.payload, m.headers, m.claimed_fencing_epoch;
   ```
-- **Phase 2 — Lock-Free Sequential Per-Aggregate Kafka Publish**:
-  - Group the claimed rows by `aggregate_id` and sort each group strictly by `(aggregate_version ASC, outbox_sequence ASC)`.
-  - For each `aggregate_id`, publish its events in order to Kafka (`partition_key = aggregate_id`, `acks=all`, `enable.idempotence=true`, `max.in.flight.requests.per.connection <= 5`). If event $k$ fails to send, **stop sending event $k+1$ for that `aggregate_id`** so $k+1$ never leapfrogs $k$!
+- **Phase 2 — Transactional Kafka Publish (`beginTransaction()` -> `send()` -> `commitTransaction()`)**:
+  - Any late packet from a paused prior worker is rejected by the Kafka broker with `ProducerFencedException`.
 - **Phase 3 — Short DB Completion Transaction (`< 2ms`)**:
   ```sql
-  UPDATE outbox_messages
-  SET relay_status = 'PUBLISHED',
-      processed_at = NOW()
-  WHERE event_id = ANY(:successfullyPublishedEventIds)
-    AND relay_owner = :podId;
+  UPDATE outbox_messages m
+  SET processed_at = NOW()
+  FROM outbox_relay_shards s
+  WHERE m.event_id = ANY(:eventIds)
+    AND m.shard_id = s.shard_id
+    AND s.shard_id = :shardId
+    AND s.owner_pod = :podId
+    AND s.fencing_epoch = :fencingEpoch;
   ```
-
-### 2. Crash Analysis: Before vs. After Kafka Publish
-1. **Crash During Phase 2 *Before* Kafka Broker Appends `E1 (v=1)`**:
-   - Neither `E1 (v=1)` nor `E2 (v=2)` reached Kafka. After `30s`, `relay_lease_until <= NOW()`. Another relay pod claims `aggregate_id` in Phase 1 and publishes `[E1 (v=1), E2 (v=2)]` in exact order.
-2. **Crash During Phase 2 *After* Kafka Broker Appends `E1 (v=1)` Before Phase 3 DB Commit**:
-   - `E1 (v=1)` is in Kafka, `E2 (v=2)` may or may not be in Kafka, and both remain `processed_at IS NULL` in PostgreSQL.
-   - After `30s`, `relay_lease_until` expires. Another pod claims `[E1 (v=1), E2 (v=2)]` and publishes `E1 (v=1)` first, then `E2 (v=2)`.
-   - Downstream consumer already processed the first delivery of `E1 (v=1)` (`last_applied_version = 1`, `event_id` in `inbox_messages`). When the re-published `E1 (v=1)` arrives before `E2 (v=2)`, the consumer's `Inbox` PK (`(event_id, consumer_group)`) AND `aggregateVersion (1) <= last_applied_version (1)` check cleanly deduplicate `E1 (v=1)` as a no-op, and then apply `E2 (v=2)`!
-3. **Why Concurrent Pod B Cannot Publish `E3 (v=3)` While Pod A Is Publishing `[E1, E2]`**:
-   - Suppose a user transaction commits `E3 (v=3, relay_status='PENDING')` for `Order O1` while Pod A is in Phase 2 publishing `[E1, E2]` (`relay_status='PUBLISHING', relay_lease_until = T + 30s`).
-   - When Pod B runs Phase 1, the `NOT EXISTS (... WHERE o2.aggregate_id = o1.aggregate_id AND o2.processed_at IS NULL AND o2.relay_status = 'PUBLISHING' AND o2.relay_lease_until > NOW())` clause sees `E1` and `E2` are currently `'PUBLISHING'` on Pod A! Thus Pod B is **mathematically blocked from claiming `E3`** until Pod A marks `E1` and `E2` `processed_at = NOW()`.
+- **Defense-in-Depth Consumer Contract**:
+  - Consumers configure `isolation.level = read_committed`, deduplicate `event_id` in `inbox_messages (event_id, consumer_group)`, ignore `incoming.aggregate_version <= aggregate.last_applied_version` as an idempotent no-op, apply `== last_applied_version + 1`, and route `> last_applied_version + 1` to `.retry` (`SEQUENCE_GAP_DETECTED`).
 
 ---
 
@@ -469,16 +539,20 @@ To guarantee that fault injection fails closed even if an operator misconfigures
 ### 2. Reproducible Test Specifications for `CH-01` through `CH-07` (`To Be Executed in M1–M7`)
 
 > [!NOTE]
-> Because `M0.2.2` is an architecture verification milestone with zero application code implemented yet, **none of the runtime tests below have been executed yet (`Status: NEEDS_EVIDENCE`)**. They are specified here as mandatory acceptance gates for `M1–M7`:
+> Because `M0.2.3` is an architecture verification milestone with zero application code implemented yet, **none of the runtime tests below have been executed yet (`Status: NEEDS_EVIDENCE`)**. They are specified here as mandatory acceptance gates for `M1–M7`:
 
 | Test ID | Challenge | Reproducible Test Specification | Expected Verification Result |
 | :--- | :--- | :--- | :--- |
 | `SPEC-CH01-T1` | `CH-01` | Use `CountDownLatch` in Testcontainers (`Postgres + Redis`): pause Writer `W1` before `TX_WRITER` commits; run Reconciler `R1` (`ABANDONED_FENCED`); release `W1`. | `W1` sees `0` rows inserted from `ON CONFLICT DO NOTHING`, queries status `'ABANDONED_FENCED'`, rolls back `TX_WRITER`, and Redis stock is incremented by `R1` **exactly once**. |
 | `SPEC-CH01-T2` | `CH-01` | Expire a claim (`stock_returned_to_redis = TRUE`), delete `released_claims` key in Redis (simulating TTL expiry), and replay `FlashSaleClaimReleased` Kafka event. | Worker checks PostgreSQL `WHERE stock_returned_to_redis = FALSE`, updates `0` rows, and skips calling `flash_sale_release.lua` (`0` double-restock). |
+| `SPEC-CH01-T3` | `CH-01` | Hold `SELECT ... FROM flash_sale_campaigns WHERE campaign_id = :id AND current_epoch = 1 FOR SHARE` open for `6s` while starting `TX_REBUILDER_FENCE_AND_SNAPSHOT`. | `idle_in_transaction_session_timeout = 3s` / `Step R0` (`pg_terminate_backend`) terminates the stalled backend, `TX_REBUILDER` bumps `current_epoch = 2`, and any late single-CTE Writer carrying `redisClaimEpoch = 1` matches `0` rows in `campaign_guard` and aborts. |
+| `SPEC-CH01-T4` | `CH-01` | Expire claim `C1` in `epoch = 1` (`release_epoch = 1`), run `TX_REBUILDER_FENCE_AND_SNAPSHOT` (`current_epoch = 2`), and invoke `flash_sale_release.lua` with `ARGV[3] = 1`. | Redis Lua returns `-2` (`STALE_EPOCH`) and does not increment `epoch = 2` stock above `allocated_quota - claimed_count`. |
 | `SPEC-CH02-T1` | `CH-02` | Send direct `webhook: payment.captured` to `INITIATED` `PaymentAttempt`. | `status` becomes `CAPTURED`, `provider_captured_at` is set, and `provider_authorized_at` remains `NULL` (not fabricated). |
 | `SPEC-CH02-T2` | `CH-02` | Transition `PaymentAttempt` to `VOIDED`, then deliver two duplicate `payment.captured` webhooks (`W1`, `W2`). | Attempt transitions to `REFUND_PENDING`, `refund_requests` inserts `1` row (`UNIQUE (attempt_id, reason_code)`), and gateway refund is invoked **once**. |
 | `SPEC-CH03-T1` | `CH-03` | Simulate Worker 1 (`lease_gen = 1`) freezing before external call, Worker 2 (`lease_gen = 2`) completing via `RECONCILING`, and Worker 1 waking up to send its external call and update DB. | Downstream deduplicates on `downstream_operation_id`; Worker 1's local DB update (`WHERE lease_generation = 1`) updates `0` rows. |
-| `SPEC-CH04-T1` | `CH-04` | Insert 10 sequential events (`v=1..10`) for `orderId = O1` while running 4 concurrent Outbox Relay threads using the 3-Phase `pg_try_advisory_xact_lock` query; inject a failure on `v=5` during Cycle 1. | Cycle 1 publishes `v=1..4` and stops at `v=5` (never publishing `v=6..10` ahead of `v=5`); Cycle 2 publishes `v=5..10`. Consumer receives strict `[1..10]` order. |
+| `SPEC-CH04-T1` | `CH-04` | Insert 10 sequential events (`v=1..10`) for `orderId = O1` while running 4 concurrent Outbox Relay threads using the `outbox_relay_shards` + `DISTINCT ON (aggregate_id)` query. | Each cycle claims only the lowest unpublished `aggregate_version` for `O1`; consumer receives strict `[1..10]` order. |
+| `SPEC-CH04-T2` | `CH-04` | Relay A (`shard_id = 3`) begins a Kafka transaction (`transactional.id = "...-shard-3"`), sends `O1:v1`, and pauses before `commitTransaction()`. Relay B steals `shard_id = 3`, calls `initTransactions()`, and publishes `O1:v1` and `O1:v2`. Resume Relay A and call `commitTransaction()`. | Kafka broker rejects Relay A with `ProducerFencedException`; `READ_COMMITTED` consumer receives strictly `[O1:v1, O1:v2]`. |
+| `SPEC-CH04-T3` | `CH-04` | Insert `O1:v1` and `O1:v2` into `outbox_messages`. Crash Relay A immediately after `commitTransaction()` for `O1:v1` before Phase 3 updates PostgreSQL. Run Relay B for 2 cycles. | `O1:v2` was never sent by Relay A; Relay B publishes `O1:v1` in Cycle 1 and `O1:v2` in Cycle 2 (`[v1, v1, v2]` in Kafka), and Consumer Inbox applies `v1` once and `v2` once. |
 | `SPEC-CH05-T1` | `CH-05` | Mint an M2M `client_credentials` token that maliciously includes `"roles": ["CUSTOMER", "ADMIN_OPS"]` in its payload, and call `POST /api/v1/orders` and `/api/v1/admin/products`. | Auth middleware classifies token as `SERVICE_PRINCIPAL`, strips human roles, and rejects both calls with `403 Forbidden`. |
 | `SPEC-CH06-T1` | `CH-06` | Attempt `INSERT INTO embedding_index_generations (dimensions=3072, index_storage_type='VECTOR_FP32')` vs `index_storage_type='HALFVEC_FP16'`. | `VECTOR_FP32` at `3072d` is rejected by PostgreSQL `CHECK` constraint; `HALFVEC_FP16` succeeds and builds `USING hnsw ((embedding::halfvec(3072)) halfvec_cosine_ops)`. |
 | `SPEC-CH07-T1` | `CH-07` | Start service with `ENVIRONMENT=production` and `FAULT_INJECTION_ENABLED=true`. | Process aborts startup immediately with `FatalSecurityConfigurationException` (`exitCode != 0`). |
