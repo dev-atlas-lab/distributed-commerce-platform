@@ -1,21 +1,21 @@
-# Architecture Challenge Refinement & Adversarial Verification (`M0.2.4` — `CH-01` through `CH-07`)
+# Architecture Challenge Refinement & Adversarial Verification (`M0.2.5` — `CH-01` through `CH-07`)
 
 - **Document ID:** `DCP-DOC-ARCH-008`
-- **Verification Reports:** [`M0_2_2_ARCHITECTURE_VERIFICATION_REPORT.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_2_ARCHITECTURE_VERIFICATION_REPORT.md), [`M0_2_3_CONCURRENCY_CORRECTIONS.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_3_CONCURRENCY_CORRECTIONS.md), [`M0_2_4_FINAL_FENCING_REVIEW.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_4_FINAL_FENCING_REVIEW.md)
+- **Verification Reports:** [`M0_2_2_ARCHITECTURE_VERIFICATION_REPORT.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_2_ARCHITECTURE_VERIFICATION_REPORT.md), [`M0_2_3_CONCURRENCY_CORRECTIONS.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_3_CONCURRENCY_CORRECTIONS.md), [`M0_2_4_FINAL_FENCING_REVIEW.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_4_FINAL_FENCING_REVIEW.md), [`M0_2_5_LOCK_AND_KAFKA_OWNERSHIP_REVIEW.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_5_LOCK_AND_KAFKA_OWNERSHIP_REVIEW.md)
 - **Status:**
   - Foundational Decisions (`Q1–Q7`): **`ACCEPTED`**
-  - `CH-01` through `CH-07`: **`PROPOSED` (Adversarially Verified & Fencing-Hardened in `M0.2.4` — Pending Explicit Human Sign-Off)**
+  - `CH-01` through `CH-07`: **`PROPOSED` (Adversarially Verified with Formal Proofs in `M0.2.5` — Pending Explicit Human Sign-Off)**
 - **Last Updated:** 2026-11-11
 
 ---
 
-## Executive Overview of `M0.2.2` – `M0.2.4` Adversarial Corrections
+## Executive Overview of `M0.2.2` – `M0.2.5` Adversarial Corrections
 
-In `M0.2.2`, `M0.2.3`, and `M0.2.4`, we performed an adversarial verification of all seven challenge specifications (`CH-01` through `CH-07`) against concurrency races, crash windows, SQL conflict clauses, network partitions, and privilege escalation vectors (`F-01` through `F-16` in [`M0_2_2_ARCHITECTURE_VERIFICATION_REPORT.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_2_ARCHITECTURE_VERIFICATION_REPORT.md), [`M0_2_3_CONCURRENCY_CORRECTIONS.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_3_CONCURRENCY_CORRECTIONS.md), and [`M0_2_4_FINAL_FENCING_REVIEW.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_4_FINAL_FENCING_REVIEW.md)):
-- **`CH-01` (`M0.2.4` Final Fencing Review — `F-11`, `F-12`, `F-15`)**: Enumerated all **8 Flash Sale mutation paths (`MP-01` through `MP-08`)** requiring explicit `campaign_guard` (`FOR SHARE` / `FOR UPDATE` on `flash_sale_campaigns` as CTE Step 1) to guarantee strict `Table 1 -> Table 2 -> Table 3` lock order and deadlock freedom; upgraded database triggers on **both** `flash_sale_claims` and `flash_sale_items` (`BEFORE INSERT OR UPDATE OR DELETE`) as an engine-level invariant; and strictly separated the **Primary Correctness Mechanism** (PostgreSQL `FOR SHARE` vs. `FOR UPDATE` lock mutual exclusion) from **Operational Liveness Policies** (`3s` session timeouts and `pg_terminate_backend`).
+In `M0.2.2` through `M0.2.5`, we performed an adversarial verification of all seven challenge specifications (`CH-01` through `CH-07`) against concurrency races, crash windows, SQL conflict clauses, network partitions, and privilege escalation vectors (`F-01` through `F-18` in [`M0_2_2_ARCHITECTURE_VERIFICATION_REPORT.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_2_ARCHITECTURE_VERIFICATION_REPORT.md), [`M0_2_3_CONCURRENCY_CORRECTIONS.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_3_CONCURRENCY_CORRECTIONS.md), [`M0_2_4_FINAL_FENCING_REVIEW.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_4_FINAL_FENCING_REVIEW.md), and [`M0_2_5_LOCK_AND_KAFKA_OWNERSHIP_REVIEW.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_5_LOCK_AND_KAFKA_OWNERSHIP_REVIEW.md)):
+- **`CH-01` (`M0.2.5` Lock Ordering Proof — `F-11`, `F-12`, `F-15`, `F-17`)**: Replaced multi-CTE joins and lock-acquiring triggers (which risked PostgreSQL `Nested Loop` target-first locking and `Table 2 -> Table 1` AB-BA deadlocks) with **Privilege-Encapsulated `SECURITY DEFINER` PL/pgSQL Stored Procedures (`fn_mp01`–`fn_mp08`)**, **`REVOKE INSERT, UPDATE, DELETE`** on `flash_sale_campaigns`, `flash_sale_claims`, and `flash_sale_items` from `promotion_app_role` (which in PostgreSQL also blocks direct `SELECT ... FOR UPDATE/SHARE` at ACL check time), and **Non-Locking Pre-Lock Witness Triggers (`trg_verify_claims_campaign_prelocked`, `trg_verify_items_campaign_prelocked`)** checking a transaction-local witness variable set in Step 1 (`SQLSTATE P0004`).
 - **`CH-02`**: Removed fabricated `authorized_at = COALESCE(authorized_at, ts)` on direct capture events (`F-04`), separated **provider-reported facts** (`provider_authorized_at`, `provider_captured_at`) from internal state transitions, and added a deterministic `refund_requests` table (`UNIQUE (attempt_id, reason_code)`) for late-capture-after-void auto-refunds (`F-05`).
 - **`CH-03`**: Explicitly analyzed why local `lease_generation` fences **local DB state** while downstream side-effect deduplication relies on passing immutable `downstream_operation_id` (and `lease_generation` for Redis) to the downstream system (`F-06`), and distinguished **Authoritative `NOT_FOUND`** from **Eventually Consistent `NOT_FOUND`** (`MANUAL_INTERVENTION_REQUIRED` escalation).
-- **`CH-04` (`M0.2.4` Final Fencing Review — `F-13`, `F-14`, `F-16`)**: Eliminated the `initTransactions()` ownership race (`F-16`) via a **Dedicated Shard Dispatcher (`StatefulSet` ordinal pinning + single worker thread per shard)** and a **Two-Stage Shard Lease State Machine (`INITIALIZING -> ACTIVE`)** in `outbox_relay_shards` (`owner_backend_pid`, `15s` monotonic pre-init watchdog vs. `35s` `initializing_deadline`, `ACTIVATE_SHARD_CAS` gate before any `Phase 1` query, and self-healing `ProducerFencedException` recovery), while preserving **Head-of-Aggregate Single-Version-Per-Cycle (`DISTINCT ON (aggregate_id)`)**.
+- **`CH-04` (`M0.2.5` Kafka Ownership Proof — `F-13`, `F-14`, `F-16`, `F-18`)**: Adopted **Approach C — Generation-Scoped `transactional.id` (`<service>-outbox-shard-<S>-gen-<G>`) + Predecessor Broker Fencing + Post-Init DB Activation CAS**, proven via a pure happens-before linearizability proof ($T_{\text{claim-B}} \prec T_{\text{fence-B}}$ and $T_{\text{init-A}} \prec T_{\text{query-A}}$) with **zero timing, `System.nanoTime()`, or process-kill assumptions**: because `gen-10` and `gen-11` are disjoint `transactional.id`s on the Kafka broker, stale Relay A (`gen-10`) can **never** fence active Relay B (`gen-11`), and in both broker orderings ($T_{\text{init-A}} \prec T_{\text{fence-B}}$ and $T_{\text{fence-B}} \prec T_{\text{init-A}}$), stale Relay A can never publish any event after takeover.
 - **`CH-05`**: Replaced the flat role union (`F-08`) with **Principal-Type Separation** (M2M `client_credentials` tokens can never hold human `CUSTOMER`/`ADMIN_*` roles) and **Target-Service Scoped Role Extraction** (`resource_access[target_service_id].roles`).
 - **`CH-06`**: Removed unverified universal recall/memory claims (`F-09`) and marked `Recall@10` and `p95` latency as **`NEEDS_EVIDENCE` (Empirical Benchmark Targets)** while preserving the verified `pgvector` `2,000d` (`vector`) vs. `4,000d` (`halfvec`) ANN index ceilings.
 - **`CH-07`**: Added a **Fail-Closed Production Startup Guard** (`F-10`): if `ENVIRONMENT == 'production'` (or `PRODUCTION_LOCK == 'true'`) and `FAULT_INJECTION_ENABLED == 'true'`, the service aborts startup immediately with `FatalSecurityConfigurationException`.
@@ -95,41 +95,39 @@ CREATE UNIQUE INDEX uq_flash_active_customer_sku
     ON flash_sale_claims (campaign_id, sku_id, customer_id)
     WHERE status IN ('CLAIMED_RESERVED', 'ORDER_MATERIALIZED', 'PAYMENT_CONFIRMED');
 
--- Defense-in-depth trigger: enforces FOR SHARE lock on flash_sale_campaigns + ACTIVE status + matching epoch
-CREATE OR REPLACE FUNCTION fn_enforce_campaign_epoch_and_lock()
+-- Non-locking pre-lock witness trigger (M0.2.5 — prevents Table 2/3 -> Table 1 AB-BA deadlock edges):
+-- Application role (promotion_app_role) has REVOKE INSERT, UPDATE, DELETE on flash_sale_campaigns,
+-- flash_sale_claims, and flash_sale_items, and may only invoke SECURITY DEFINER functions fn_mp01..fn_mp08.
+CREATE OR REPLACE FUNCTION fn_verify_campaign_prelocked()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
 DECLARE
-    v_current_epoch BIGINT;
-    v_status        VARCHAR(32);
+    v_campaign_id  UUID := COALESCE(NEW.campaign_id, OLD.campaign_id);
+    v_locked_epoch TEXT;
 BEGIN
-    SELECT current_epoch, status
-      INTO v_current_epoch, v_status
-      FROM flash_sale_campaigns
-     WHERE campaign_id = NEW.campaign_id
-       FOR SHARE;
-
-    IF NOT FOUND OR v_status <> 'ACTIVE' THEN
-        RAISE EXCEPTION 'CAMPAIGN_NOT_ACTIVE_FENCED: campaign=% status=%', NEW.campaign_id, v_status
-            USING ERRCODE = 'P0001';
+    v_locked_epoch := current_setting(
+        'promotion.locked_campaign_' || replace(v_campaign_id::text, '-', ''),
+        true
+    );
+    IF v_locked_epoch IS NULL OR v_locked_epoch = '' THEN
+        RAISE EXCEPTION 'LOCK_ORDER_VIOLATION: flash_sale_campaigns(%) must be locked before mutating %',
+            v_campaign_id, TG_TABLE_NAME USING ERRCODE = 'P0004';
     END IF;
-
-    IF TG_OP = 'INSERT' AND NEW.campaign_epoch <> v_current_epoch THEN
-        RAISE EXCEPTION 'STALE_CAMPAIGN_EPOCH_FENCED: claim_epoch=% current_epoch=%',
-            NEW.campaign_epoch, v_current_epoch
-            USING ERRCODE = 'P0002';
-    END IF;
-
-    RETURN NEW;
+    RETURN COALESCE(NEW, OLD);
 END;
 $$;
 
-CREATE TRIGGER trg_enforce_campaign_epoch_and_lock
-BEFORE INSERT OR UPDATE OF status ON flash_sale_claims
-FOR EACH ROW
-WHEN (NEW.status IN ('CLAIMED_RESERVED', 'ABANDONED_FENCED', 'EXPIRED', 'CANCELLED')
-      AND (TG_OP = 'INSERT' OR OLD.status IS DISTINCT FROM NEW.status))
-EXECUTE FUNCTION fn_enforce_campaign_epoch_and_lock();
+CREATE TRIGGER trg_verify_claims_campaign_prelocked
+BEFORE INSERT OR UPDATE OR DELETE ON flash_sale_claims
+FOR EACH ROW EXECUTE FUNCTION fn_verify_campaign_prelocked();
+
+CREATE TRIGGER trg_verify_items_campaign_prelocked
+BEFORE INSERT OR UPDATE OR DELETE ON flash_sale_items
+FOR EACH ROW EXECUTE FUNCTION fn_verify_campaign_prelocked();
 ```
+
+> [!IMPORTANT]
+> **Complete Imperative `SECURITY DEFINER` Stored Procedures (`fn_mp01` through `fn_mp08`)**:
+> See [`M0_2_5_LOCK_AND_KAFKA_OWNERSHIP_REVIEW.md#232`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_5_LOCK_AND_KAFKA_OWNERSHIP_REVIEW.md) for the complete PL/pgSQL definitions of all 8 mutation paths (`fn_mp01_writer_claim`, `fn_mp02_reconcile_fenced`, `fn_mp03_expire_or_cancel`, `fn_mp04_restock_finalize`, `fn_mp05_order_payment_progress`, `fn_mp06_admin_configure_item`, `fn_mp07_rebuilder_fence_and_snapshot`, `fn_mp08_campaign_lifecycle`), where `Step 1` imperatively locks `flash_sale_campaigns` and sets `promotion.locked_campaign_<uuid>` before `Step 2` (`flash_sale_claims`) or `Step 3` (`flash_sale_items`) executes.
 
 #### 1.2 Exact Single-Statement Data-Modifying CTE for Writer (`TX_WRITER`)
 All five steps execute inside **one single-roundtrip SQL statement** (with session timeouts `statement_timeout = '3s'`, `idle_in_transaction_session_timeout = '3s'`, `lock_timeout = '2s'`), eliminating any possibility of a client JVM/.NET pause between statements while holding an open transaction:
@@ -363,38 +361,40 @@ When Worker 2 (`lease_generation > 1`) enters `RECONCILING` and queries the down
 
 ---
 
-## `CH-04`: Dedicated Shard Dispatcher with Two-Stage `INITIALIZING -> ACTIVE` Ownership & Head-Event Cycle
+## `CH-04`: Generation-Scoped `transactional.id` (`Approach C`), Predecessor Broker Fencing & Head-Event Cycle
 
-- **Status:** `PROPOSED` (Redesigned & Logically Verified in `M0.2.4` — Pending Final Sign-Off)
+- **Status:** `PROPOSED` (Redesigned with Formal Happens-Before Proof in `M0.2.5` — Pending Final Sign-Off)
 - **Related ADRs:** [`ADR-0003`](file:///home/anhltn/projects/distributed-commerce-platform/docs/adr/ADR-0003-transactional-outbox-and-inbox-idempotency.md), [`ADR-0010`](file:///home/anhltn/projects/distributed-commerce-platform/docs/adr/ADR-0010-event-contracts-json-schema-and-kafka-kraft.md)
-- **Detailed Concurrency Reports:** [`M0_2_3_CONCURRENCY_CORRECTIONS.md#3-ch-04-redesign`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_3_CONCURRENCY_CORRECTIONS.md), [`M0_2_4_FINAL_FENCING_REVIEW.md#3-ch-04`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_4_FINAL_FENCING_REVIEW.md)
+- **Detailed Concurrency Reports:** [`M0_2_5_LOCK_AND_KAFKA_OWNERSHIP_REVIEW.md#3-ch-04`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_5_LOCK_AND_KAFKA_OWNERSHIP_REVIEW.md)
 
-### 1. Eliminating Stale Publishers (`[v1, v2, v1]`), Batch-Crash Replays (`[v1, v2, v1, v2]`), and the `initTransactions()` Ownership Race (`F-13`, `F-14`, `F-16`)
+### 1. Eliminating Stale Publishers (`[v1, v2, v1]`), Batch-Crash Replays (`[v1, v2, v1, v2]`), and the Pre-`initTransactions()` Suspension Race (`F-13`, `F-14`, `F-16`, `F-18`)
 
-As proven in [`M0_2_4_FINAL_FENCING_REVIEW.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_4_FINAL_FENCING_REVIEW.md):
-1. **Dedicated Shard Dispatcher (`StatefulSet` Ordinal Pinning + Single Worker Thread per Shard)**:
-   - Outbox Relay workers run in a dedicated Shard Dispatcher (not inside all $N$ stateless HTTP API pods). Each `shard_id` (`0..15`) is owned by a single dedicated thread that calls `initTransactions()` **once** during shard acquisition and **never** calls `initTransactions()` while in `ACTIVE` state.
-2. **Two-Stage Shard Lease State Machine (`INITIALIZING -> ACTIVE`)**:
-   - **Step 1 (`ACQUIRE_INITIALIZING`)**: Terminates any expired prior backend session (`pg_terminate_backend(owner_backend_pid)`) and sets `status = 'INITIALIZING'`, `fencing_epoch = fencing_epoch + 1`, `initializing_deadline = NOW() + 35s`. **Zero outbox rows may be read or claimed while `status = 'INITIALIZING'`!**
-   - **Step 2 (`BROKER_INIT_TRANSACTIONS` with `15s` Monotonic Watchdog)**: Checks `(System.nanoTime() - localStartNanos) <= 15s` and calls `txProducer.initTransactions()` (`default.api.timeout.ms = 15s`, `35s` takeover delay `> 2x` local cutoff). If a thread paused `> 35s` before `initTransactions()`, the `15s` monotonic pre-check aborts in user space before touching Kafka.
-   - **Step 3 (`ACTIVATE_SHARD_CAS`)**: After `initTransactions()` returns, executes `UPDATE outbox_relay_shards SET status = 'ACTIVE', broker_fenced_epoch = :myEpoch WHERE shard_id = :shardId AND owner_pod = :podId AND fencing_epoch = :myEpoch AND status = 'INITIALIZING'`. If `0` rows are updated (a newer owner took over), the producer is immediately closed without ever reading or publishing a single row from `outbox_messages`.
-   - **Self-Healing `ProducerFencedException` Recovery**: Once `ACTIVE`, a worker never calls `initTransactions()`. If an `ACTIVE` owner catches `ProducerFencedException` while still owning the DB shard, it re-enters `acquire_and_initialize_shard()` (`fencing_epoch + 1`), re-runs `initTransactions()` (`ProducerEpoch++`), and resumes seamlessly.
+As proven in [`M0_2_5_LOCK_AND_KAFKA_OWNERSHIP_REVIEW.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_5_LOCK_AND_KAFKA_OWNERSHIP_REVIEW.md) (**Approach C** — zero reliance on `System.nanoTime()`, `pg_terminate_backend`, or `StatefulSet` split-brain assumptions):
+1. **Generation-Scoped Disjoint `transactional.id` (`<service>-outbox-shard-<S>-gen-<G>`)**:
+   - Every shard lease generation $G$ (`fencing_epoch = G` in `outbox_relay_shards`) uses its own immutable, disjoint Kafka `transactional.id = "<service>-outbox-shard-" + shard_id + "-gen-" + G`.
+   - Because `gen-10` and `gen-11` are distinct `transactional.id`s on the Kafka broker, **a suspended Relay A (`gen-10`) resuming and calling `initTransactions("...-gen-10")` can NEVER fence active Relay B (`"...-gen-11"`)**!
+2. **Predecessor Generation Broker Fencing + Post-Init DB Activation CAS ($T_{\text{claim-B}} \prec T_{\text{fence-B}}$ and $T_{\text{init-A}} \prec T_{\text{query-A}}$)**:
+   - **Step 1 ($T_{\text{claim-B}}$)**: Relay B claims `fencing_epoch = 11, status = 'INITIALIZING'` in PostgreSQL (reading `broker_fenced_up_to_epoch = 9`). Zero outbox rows are read in `INITIALIZING`.
+   - **Step 2 ($T_{\text{fence-B}}$)**: Relay B fences every predecessor generation $e \in (\text{broker\_fenced\_up\_to\_epoch}, 10]$ on the Kafka broker by calling `fencerProducer.initTransactions("...-shard-3-gen-" + e)` and closing it.
+   - **Step 3 ($T_{\text{init-B}}$)**: Relay B calls `txProducerB.initTransactions("...-shard-3-gen-11")`.
+   - **Step 4 ($T_{\text{query}}$ / `ACTIVATE_SHARD_CAS`)**: Only *after* `initTransactions()` returns does a worker execute `UPDATE outbox_relay_shards SET status = 'ACTIVE', broker_fenced_up_to_epoch = :myEpoch - 1 WHERE shard_id = :shardId AND fencing_epoch = :myEpoch AND status = 'INITIALIZING'`.
+   - **Happens-Before Proof**:
+     - If $T_{\text{init-A}} \prec T_{\text{fence-B}}$: Relay B's Step 2 fences `"...-gen-10"` on the Kafka broker (`ProducerFencedException`).
+     - If $T_{\text{fence-B}} \prec T_{\text{init-A}}$ (Relay A was suspended before `initTransactions`): By transitivity $T_{\text{claim-B}} \prec T_{\text{fence-B}} \prec T_{\text{init-A}} \prec T_{\text{query-A}}$, so when Relay A finishes `initTransactions("...-gen-10")` and executes Step 4 (`T_query-A`: `WHERE fencing_epoch = 10`) in PostgreSQL, `fencing_epoch` is already `>= 11`! Relay A gets `0` rows, reads `0` events, and exits without ever touching `"...-gen-11"`.
 3. **Head-of-Aggregate Single-Version-Per-Cycle (`DISTINCT ON (aggregate_id)`)**:
    - Each `Phase 1` batch claims **at most ONE event (the lowest unpublished `aggregate_version`) per `aggregate_id`** across up to `100` distinct aggregates in that shard (`status = 'ACTIVE'`). Version `v+1` is never sent to Kafka until version `v` is committed in Kafka and marked `processed_at = NOW()` in PostgreSQL.
 
 #### 1.1 Updated `outbox_relay_shards` & `outbox_messages` Schema
 ```sql
 CREATE TABLE outbox_relay_shards (
-    shard_id              INTEGER PRIMARY KEY CHECK (shard_id BETWEEN 0 AND 15),
-    status                VARCHAR(24)  NOT NULL DEFAULT 'IDLE'
-                          CHECK (status IN ('IDLE', 'INITIALIZING', 'ACTIVE')),
-    owner_pod             VARCHAR(128) NULL,
-    owner_backend_pid     INTEGER      NULL,
-    fencing_epoch         BIGINT       NOT NULL DEFAULT 0,
-    broker_fenced_epoch   BIGINT       NOT NULL DEFAULT 0,
-    initializing_deadline TIMESTAMPTZ  NULL,
-    lease_until           TIMESTAMPTZ  NOT NULL DEFAULT '-infinity',
-    updated_at            TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+    shard_id                   INTEGER PRIMARY KEY CHECK (shard_id BETWEEN 0 AND 15),
+    status                     VARCHAR(24)  NOT NULL DEFAULT 'IDLE'
+                               CHECK (status IN ('IDLE', 'INITIALIZING', 'ACTIVE')),
+    owner_pod                  VARCHAR(128) NULL,
+    fencing_epoch              BIGINT       NOT NULL DEFAULT 0,
+    broker_fenced_up_to_epoch  BIGINT       NOT NULL DEFAULT 0,
+    lease_until                TIMESTAMPTZ  NOT NULL DEFAULT '-infinity',
+    updated_at                 TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE outbox_messages (
@@ -423,7 +423,7 @@ CREATE INDEX idx_outbox_shard_head
 ```
 
 #### 1.2 Exact 3-Phase Shard-Fenced Outbox Relay SQL (`status = 'ACTIVE'` Required)
-- **Step 0 (`INITIALIZING -> initTransactions() -> ACTIVE` Two-Stage Handshake)**: See full SQL and pseudocode in [`M0_2_4_FINAL_FENCING_REVIEW.md#332`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_4_FINAL_FENCING_REVIEW.md).
+- **Step 0 (`INITIALIZING -> Predecessor Fence -> initTransactions(gen-G) -> ACTIVE`)**: See full SQL and pseudocode in [`M0_2_5_LOCK_AND_KAFKA_OWNERSHIP_REVIEW.md#342`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_5_LOCK_AND_KAFKA_OWNERSHIP_REVIEW.md).
 - **Phase 1 — Renew `ACTIVE` Lease & Claim Only the Head Event (`DISTINCT ON (aggregate_id)`) Per Aggregate (`< 2ms` TX)**:
   ```sql
   WITH renewed_shard AS (
@@ -434,7 +434,7 @@ CREATE INDEX idx_outbox_shard_head
         AND status = 'ACTIVE'
         AND owner_pod = :podId
         AND fencing_epoch = :myEpoch
-        AND broker_fenced_epoch = :myEpoch
+        AND broker_fenced_up_to_epoch = :myEpoch - 1
         AND lease_until > NOW()
       RETURNING shard_id, fencing_epoch
   ),
@@ -551,14 +551,15 @@ To guarantee that fault injection fails closed even if an operator misconfigures
 | `SPEC-CH01-T2` | `CH-01` | Expire a claim (`stock_returned_to_redis = TRUE`), delete `released_claims` key in Redis (simulating TTL expiry), and replay `FlashSaleClaimReleased` Kafka event. | Worker checks PostgreSQL `WHERE stock_returned_to_redis = FALSE`, updates `0` rows, and skips calling `flash_sale_release.lua` (`0` double-restock). |
 | `SPEC-CH01-T3` | `CH-01` | Hold `SELECT ... FROM flash_sale_campaigns WHERE campaign_id = :id AND current_epoch = 1 FOR SHARE` open for `6s` while starting `TX_REBUILDER_FENCE_AND_SNAPSHOT`. | `idle_in_transaction_session_timeout = 3s` / `Step R0` (`pg_terminate_backend`) terminates the stalled backend, `TX_REBUILDER` bumps `current_epoch = 2`, and any late single-CTE Writer carrying `redisClaimEpoch = 1` matches `0` rows in `campaign_guard` and aborts. |
 | `SPEC-CH01-T4` | `CH-01` | Expire claim `C1` in `epoch = 1` (`release_epoch = 1`), run `TX_REBUILDER_FENCE_AND_SNAPSHOT` (`current_epoch = 2`), and invoke `flash_sale_release.lua` with `ARGV[3] = 1`. | Redis Lua returns `-2` (`STALE_EPOCH`) and does not increment `epoch = 2` stock above `allocated_quota - claimed_count`. |
-| `SPEC-CH01-T5` | `CH-01` | Attempt (a) `UPDATE flash_sale_claims SET stock_returned_to_redis = TRUE` with stale `release_epoch < current_epoch`, (b) `UPDATE flash_sale_claims SET status = 'ORDER_MATERIALIZED'` during `REBUILDING_GATE`, and (c) `UPDATE flash_sale_items` during `REBUILDING_GATE`. | All three mutations are blocked by `campaign_guard` and rejected by `trg_enforce_claims_campaign_lock` / `trg_enforce_items_campaign_lock` (`SQLSTATE P0001`/`P0003`). |
+| `SPEC-CH01-T5` | `CH-01` | Attempt (a) `UPDATE flash_sale_claims SET stock_returned_to_redis = TRUE` with stale `release_epoch < current_epoch`, (b) `UPDATE flash_sale_claims SET status = 'ORDER_MATERIALIZED'` during `REBUILDING_GATE`, and (c) `UPDATE flash_sale_items` during `REBUILDING_GATE`. | All three mutations are blocked by `fn_mp04`/`fn_mp05`/`fn_mp06` and rejected (`SQLSTATE P0001`). |
+| `SPEC-CH01-T6` | `CH-01` | Connect as `promotion_app_role` and attempt direct `SELECT * FROM flash_sale_claims FOR UPDATE` or `UPDATE flash_sale_claims`; connect as `promotion_schema_owner` and attempt direct `UPDATE flash_sale_claims` without setting `promotion.locked_campaign_<uuid>`. | `promotion_app_role` fails with `SQLSTATE 42501 (permission denied)`; `promotion_schema_owner` fails with `SQLSTATE P0004 (LOCK_ORDER_VIOLATION)` from `trg_verify_claims_campaign_prelocked` with zero reverse lock wait edges. |
 | `SPEC-CH02-T1` | `CH-02` | Send direct `webhook: payment.captured` to `INITIATED` `PaymentAttempt`. | `status` becomes `CAPTURED`, `provider_captured_at` is set, and `provider_authorized_at` remains `NULL` (not fabricated). |
 | `SPEC-CH02-T2` | `CH-02` | Transition `PaymentAttempt` to `VOIDED`, then deliver two duplicate `payment.captured` webhooks (`W1`, `W2`). | Attempt transitions to `REFUND_PENDING`, `refund_requests` inserts `1` row (`UNIQUE (attempt_id, reason_code)`), and gateway refund is invoked **once**. |
 | `SPEC-CH03-T1` | `CH-03` | Simulate Worker 1 (`lease_gen = 1`) freezing before external call, Worker 2 (`lease_gen = 2`) completing via `RECONCILING`, and Worker 1 waking up to send its external call and update DB. | Downstream deduplicates on `downstream_operation_id`; Worker 1's local DB update (`WHERE lease_generation = 1`) updates `0` rows. |
 | `SPEC-CH04-T1` | `CH-04` | Insert 10 sequential events (`v=1..10`) for `orderId = O1` while running 4 concurrent Outbox Relay threads using the `outbox_relay_shards` + `DISTINCT ON (aggregate_id)` query. | Each cycle claims only the lowest unpublished `aggregate_version` for `O1`; consumer receives strict `[1..10]` order. |
-| `SPEC-CH04-T2` | `CH-04` | Relay A (`shard_id = 3`) begins a Kafka transaction (`transactional.id = "...-shard-3"`), sends `O1:v1`, and pauses before `commitTransaction()`. Relay B steals `shard_id = 3`, calls `initTransactions()`, and publishes `O1:v1` and `O1:v2`. Resume Relay A and call `commitTransaction()`. | Kafka broker rejects Relay A with `ProducerFencedException`; `READ_COMMITTED` consumer receives strictly `[O1:v1, O1:v2]`. |
+| `SPEC-CH04-T2` | `CH-04` | Relay A (`shard_id = 3`, `gen = 10`) begins a Kafka transaction (`transactional.id = "...-shard-3-gen-10"`), sends `O1:v1`, and pauses before `commitTransaction()`. Relay B steals `shard_id = 3` (`gen = 11`), fences `"...-gen-10"`, inits `"...-gen-11"`, and publishes `O1:v1` and `O1:v2`. Resume Relay A and call `commitTransaction()`. | Kafka broker rejects Relay A with `ProducerFencedException`; `READ_COMMITTED` consumer receives strictly `[O1:v1, O1:v2]`. |
 | `SPEC-CH04-T3` | `CH-04` | Insert `O1:v1` and `O1:v2` into `outbox_messages`. Crash Relay A immediately after `commitTransaction()` for `O1:v1` before Phase 3 updates PostgreSQL. Run Relay B for 2 cycles. | `O1:v2` was never sent by Relay A; Relay B publishes `O1:v1` in Cycle 1 and `O1:v2` in Cycle 2 (`[v1, v1, v2]` in Kafka), and Consumer Inbox applies `v1` once and `v2` once. |
-| `SPEC-CH04-T4` | `CH-04` | Relay A acquires `fencing_epoch = 10` (`status = 'INITIALIZING'`) and pauses `> 35s` before `initTransactions()`. Relay B acquires `fencing_epoch = 11`, activates (`status = 'ACTIVE'`), and publishes `O1:v1`. Resume Relay A. | (1) `15s` monotonic pre-check aborts Relay A before `initTransactions()`; (2) even if `initTransactions()` is forced in white-box test, Relay A fails Step 3 `ACTIVATE_SHARD_CAS` (`0` rows, `0` events read/sent) and Relay B self-heals (`fencing_epoch = 12`) and publishes `O1:v2`. |
+| `SPEC-CH04-T4` / `T5` | `CH-04` | Relay A acquires `fencing_epoch = 10` (`status = 'INITIALIZING'`, `txId = "...-shard-3-gen-10"`) and is suspended immediately before `txProducerA.initTransactions()`. Lease expires; Relay B acquires `fencing_epoch = 11`, fences `"...-gen-10"`, inits `"...-gen-11"`, activates (`status = 'ACTIVE'`), and publishes `O1:v1`. Resume Relay A so `txProducerA.initTransactions("...-gen-10")` executes. | (1) Relay B (`"...-gen-11"`) is **never fenced** (disjoint `transactional.id`) and publishes `O1:v2` uninterrupted; (2) Relay A fails Step 4 `ACTIVATE_SHARD_CAS` (`0` rows updated because `fencing_epoch = 11 != 10`), reads `0` events, and publishes `0` messages. |
 | `SPEC-CH05-T1` | `CH-05` | Mint an M2M `client_credentials` token that maliciously includes `"roles": ["CUSTOMER", "ADMIN_OPS"]` in its payload, and call `POST /api/v1/orders` and `/api/v1/admin/products`. | Auth middleware classifies token as `SERVICE_PRINCIPAL`, strips human roles, and rejects both calls with `403 Forbidden`. |
 | `SPEC-CH06-T1` | `CH-06` | Attempt `INSERT INTO embedding_index_generations (dimensions=3072, index_storage_type='VECTOR_FP32')` vs `index_storage_type='HALFVEC_FP16'`. | `VECTOR_FP32` at `3072d` is rejected by PostgreSQL `CHECK` constraint; `HALFVEC_FP16` succeeds and builds `USING hnsw ((embedding::halfvec(3072)) halfvec_cosine_ops)`. |
 | `SPEC-CH07-T1` | `CH-07` | Start service with `ENVIRONMENT=production` and `FAULT_INJECTION_ENABLED=true`. | Process aborts startup immediately with `FatalSecurityConfigurationException` (`exitCode != 0`). |
