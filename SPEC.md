@@ -2,8 +2,8 @@
 
 - **Repository:** `dev-atlas-lab/distributed-commerce-platform`
 - **Organization:** [dev-atlas-lab](https://github.com/dev-atlas-lab)
-- **Milestone:** `M0.2.3 — Final Concurrency Corrections (CH-01 & CH-04)`
-- **Status:** `ACCEPTED` (Core Decisions `Q1–Q7` Accepted; `CH-01`–`CH-07` Adversarially Verified & Concurrency-Hardened in [`M0_2_2_ARCHITECTURE_VERIFICATION_REPORT.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_2_ARCHITECTURE_VERIFICATION_REPORT.md) and [`M0_2_3_CONCURRENCY_CORRECTIONS.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_3_CONCURRENCY_CORRECTIONS.md) — Pending Final Sign-Off)
+- **Milestone:** `M0.2.4 — Final Fencing Review (CH-01 & CH-04)`
+- **Status:** `ACCEPTED` (Core Decisions `Q1–Q7` Accepted; `CH-01`–`CH-07` Adversarially Verified & Fencing-Hardened in [`M0_2_2_ARCHITECTURE_VERIFICATION_REPORT.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_2_ARCHITECTURE_VERIFICATION_REPORT.md), [`M0_2_3_CONCURRENCY_CORRECTIONS.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_3_CONCURRENCY_CORRECTIONS.md), and [`M0_2_4_FINAL_FENCING_REVIEW.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_4_FINAL_FENCING_REVIEW.md) — Pending Final Sign-Off)
 - **Last Updated:** 2026-11-11
 
 ---
@@ -39,6 +39,7 @@ distributed-commerce-platform/
 ├── SPEC.md
 ├── M0_2_2_ARCHITECTURE_VERIFICATION_REPORT.md
 ├── M0_2_3_CONCURRENCY_CORRECTIONS.md
+├── M0_2_4_FINAL_FENCING_REVIEW.md
 ├── ENGINEERING_ROADMAP.md
 ├── BACKLOG.md
 ├── docs/
@@ -127,12 +128,12 @@ All 7 foundational decisions (`Q1–Q7`) have been reviewed and **approved (`Sta
 6. **Q6 (`ACCEPTED` — [`ADR-0007`](file:///home/anhltn/projects/distributed-commerce-platform/docs/adr/ADR-0007-catalog-search-postgresql-fts-vs-opensearch.md))**: Start with **PostgreSQL 17 Full-Text Search (`tsvector` + `pg_trgm` + `JSONB` GIN)** and benchmark with `k6` before considering **OpenSearch**.
 7. **Q7 (`ACCEPTED` — [`ADR-0008`](file:///home/anhltn/projects/distributed-commerce-platform/docs/adr/ADR-0008-ai-agent-security-boundary-and-pgvector-rag.md))**: Use a **Multi-Provider AI Abstraction Port** supporting **OpenAI**, **Google Gemini**, and **Anthropic Claude** behind a zero-privilege API-only tool boundary.
 
-### Pending `M0.2.3` Deep Architecture Challenge Sign-Off (`Status: PROPOSED`)
-See [`docs/architecture/ARCHITECTURE_CHALLENGE_M0_1.md`](file:///home/anhltn/projects/distributed-commerce-platform/docs/architecture/ARCHITECTURE_CHALLENGE_M0_1.md) and [`M0_2_3_CONCURRENCY_CORRECTIONS.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_3_CONCURRENCY_CORRECTIONS.md) for the `M0.2.3` specifications (`CH-01` through `CH-07`) awaiting your final sign-off before we transition to `M1`:
-- **`CH-01` (`PROPOSED` — Redesigned in `M0.2.3`)**: Single-statement CTE atomicity acquiring `FOR SHARE` on `flash_sale_campaigns`, PostgreSQL PK index-lock serialization when Writer and Reconciler collide, epoch-validated `flash_sale_release.lua` (`release_epoch == redis_epoch` + `HSETNX released_claims`), sleep-free `FOR UPDATE` lock-serialized `REBUILDING_GATE` Redis failover recovery (`3s` `idle_in_transaction_session_timeout` + `pg_terminate_backend`), and `24h` post-campaign key TTL cleanup.
+### Pending `M0.2.4` Deep Architecture Challenge Sign-Off (`Status: PROPOSED`)
+See [`docs/architecture/ARCHITECTURE_CHALLENGE_M0_1.md`](file:///home/anhltn/projects/distributed-commerce-platform/docs/architecture/ARCHITECTURE_CHALLENGE_M0_1.md) and [`M0_2_4_FINAL_FENCING_REVIEW.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_4_FINAL_FENCING_REVIEW.md) for the `M0.2.4` specifications (`CH-01` through `CH-07`) awaiting your final sign-off before we transition to `M1`:
+- **`CH-01` (`PROPOSED` — Finalized in `M0.2.4`)**: Complete 8-path `campaign_guard` CTE `FOR SHARE` / `FOR UPDATE` barrier (`1. flash_sale_campaigns -> 2. flash_sale_claims -> 3. flash_sale_items`) + dual-table `BEFORE INSERT OR UPDATE OR DELETE` triggers, epoch-validated `flash_sale_release.lua`, and strict separation of PostgreSQL `FOR UPDATE` mutual exclusion (correctness) from `3s` session timeouts / `pg_terminate_backend` (liveness).
 - **`CH-02` (`PROPOSED` — Verified in `M0.2.2`)**: Explicit **`Order` and `PaymentAttempt` State Transition Matrices** + non-fabricated provider fact timestamps (`provider_authorized_at`, `provider_captured_at`, `provider_voided_at`, `provider_refunded_at`) + `refund_requests` (`UNIQUE (attempt_id, reason_code)`).
 - **`CH-03` (`PROPOSED` — Verified in `M0.2.2`)**: Monotonic **`lease_generation` fencing tokens**, immutable `downstream_operation_id`, and **`RECONCILING` state** (distinguishing Type I authoritative `NOT_FOUND` from Type II eventual `NOT_FOUND` -> `MANUAL_INTERVENTION_REQUIRED`).
-- **`CH-04` (`PROPOSED` — Redesigned in `M0.2.3`)**: **Shard-Scoped Single-Writer Leases (`outbox_relay_shards`) + Deterministic Kafka `transactional.id` Broker-Enforced `ProducerEpoch` Fencing + Head-of-Aggregate Single-Version-Per-Cycle (`DISTINCT ON (aggregate_id)`)**, paired with `READ_COMMITTED` consumer Inbox deduplication and sequence-gap detection.
+- **`CH-04` (`PROPOSED` — Finalized in `M0.2.4`)**: **Dedicated Shard Dispatcher (`StatefulSet` ordinal pinning + single thread per shard) + Two-Stage `INITIALIZING -> ACTIVE` Ownership State Machine (`owner_backend_pid`, `15s` pre-init watchdog vs. `35s` `initializing_deadline`, `ACTIVATE_SHARD_CAS` before any `Phase 1` query, self-healing `ProducerFencedException` recovery) + Head-of-Aggregate Single-Version-Per-Cycle (`DISTINCT ON (aggregate_id)`)**.
 - **`CH-05` (`PROPOSED` — Direction Approved, Final Validation)**: Explicitly separated OIDC `id_token` (`aud: "commerce-web-spa"`, SPA-only) from RFC 9068 OAuth2 `access_token` (`aud: "commerce-api"`, Resource Servers), defined the 5-step Keycloak-compatible claim normalization pipeline (`client_id`/`azp`, `roles`/`realm_access.roles`, `scope`), and established the per-service policy matrix.
 - **`CH-06` (`PROPOSED` — Corrected in `M0.2.1`)**: Explicitly distinguished `pgvector` unindexed column limit (`16,000d`) from **HNSW/IVFFlat ANN index ceilings (`2,000d` for FP32 `vector` vs. `4,000d` for FP16 `halfvec`)**, enforced via DB `CHECK` constraint so `3072d` models use `halfvec_cosine_ops` with model-generation isolation.
 - **`CH-07` (`PROPOSED` — Direction Approved, Final Validation)**: Enforced zero-trust on W3C `baggage` (never used for auth/identity), restricted fault injection to server-registered `fault.profile_id` lookups (`fault-profiles.yaml`) with target allowlists and mandatory audit logs, and excluded fault injection in production builds.
