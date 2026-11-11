@@ -14,20 +14,12 @@
     <artifactId>commerce-building-blocks</artifactId>
     <packaging>jar</packaging>
     <name>Commerce Building Blocks (Java 21)</name>
-    <description>Shared cross-cutting foundations: Correlation ID, RFC 9457 ProblemDetails, OpenTelemetry hooks, and CH-07 Fail-Closed Fault Injection Guard.</description>
+    <description>Shared cross-cutting technical foundations: Correlation ID, RFC 9457 ProblemDetails, and CH-07 Fail-Closed Fault Injection Guard.</description>
 
     <dependencies>
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-web</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-actuator</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>io.micrometer</groupId>
-            <artifactId>micrometer-tracing-bridge-otel</artifactId>
         </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>

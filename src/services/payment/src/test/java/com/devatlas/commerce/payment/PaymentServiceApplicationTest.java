@@ -16,8 +16,12 @@ import org.springframework.test.web.servlet.MockMvc;
 @AutoConfigureMockMvc
 class PaymentServiceApplicationTest {
 
+    private final MockMvc mockMvc;
+
     @Autowired
-    private MockMvc mockMvc;
+    PaymentServiceApplicationTest(MockMvc mockMvc) {
+        this.mockMvc = mockMvc;
+    }
 
     @Test
     void shouldExposeLivenessAndReadinessProbesWithCorrelationHeader() throws Exception {

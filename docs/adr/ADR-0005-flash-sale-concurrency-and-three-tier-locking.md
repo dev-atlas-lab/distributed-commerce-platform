@@ -21,11 +21,16 @@ In our Flash Sale scenario (`100,000` users competing for `1,000` units):
    - **Tier 3 (Standard Stock)**: Conditional atomic SQL (`UPDATE stock_items ... WHERE available_qty >= :qty`) ordered by `sku_id ASC`.
    - **Tier 4 (Low-Contention Entities)**: `@Version` Optimistic Concurrency Control.
 2. **Frozen `M0.3` Database Concurrency & Security Model (`CH-01`, `HD-01`, `HD-02`, `HD-03`)**:
-   - **Least-Privilege Role Hierarchy (`HD-03`)**:
+   - **Least-Privilege Role Hierarchy & Schema Hardening (`HD-03` — `NEEDS_EVIDENCE` until `M1` SQL Migrations)**:
+     - `promotion_migrator`: Dedicated CI/CD migration login role (`LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE`) used exclusively during deployment migrations to execute DDL and assign ownership (`ALTER TABLE/FUNCTION ... OWNER TO promotion_proc_owner`).
      - `promotion_proc_owner`: Dedicated non-login, non-superuser role (`NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE`) that owns the protected tables (`flash_sale_campaigns`, `flash_sale_claims`, `flash_sale_items`, `outbox_messages`, `idempotency_records`) and the 8 `SECURITY DEFINER` stored procedures (`fn_mp01` through `fn_mp08`).
-     - `promotion_app_role`: Runtime application database login role. Direct `INSERT, UPDATE, DELETE` (and consequently `SELECT ... FOR UPDATE/SHARE`) privileges on the protected tables are **revoked** from `promotion_app_role` and `PUBLIC`. Explicit `GRANT EXECUTE ON FUNCTION ... TO promotion_app_role` is granted only on `fn_mp01`–`fn_mp08`.
-     - Every `SECURITY DEFINER` function declares an immutable `SET search_path = pg_catalog, public` to prevent object-shadowing attacks.
-     - Schema migration (`promotion_migrator`) and emergency break-glass DBA sessions are separated from `promotion_app_role` and must respect the canonical lock hierarchy during online operations.
+     - `promotion_app_role`: Runtime application database login role (`LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE`). Direct `INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER` (and consequently `SELECT ... FOR UPDATE/SHARE`) privileges on the protected tables are **revoked** from `promotion_app_role` and `PUBLIC`.
+     - **Public Schema `CREATE` Lockdown & `search_path` Safety**:
+       - `REVOKE CREATE ON SCHEMA public FROM PUBLIC;` and `REVOKE CREATE ON SCHEMA public FROM promotion_app_role;` (`GRANT USAGE ON SCHEMA public TO promotion_app_role;` only) so `promotion_app_role` can never create trojan objects in `public`.
+       - Every `SECURITY DEFINER` function declares an immutable `SET search_path = pg_catalog, public` and schema-qualifies all table and function references.
+     - **Function `EXECUTE` Grant Hardening**:
+       - Because PostgreSQL grants `EXECUTE` on newly created functions to `PUBLIC` by default, migrations MUST execute `ALTER DEFAULT PRIVILEGES FOR ROLE promotion_proc_owner IN SCHEMA public REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;` and `REVOKE ALL ON FUNCTION fn_mp01..fn_mp08 FROM PUBLIC;` before granting `GRANT EXECUTE ON FUNCTION ... TO promotion_app_role;`.
+     - `promotion_dba_admin`: Break-glass administrative role separated from `promotion_app_role`; must respect the canonical lock hierarchy during online maintenance.
    - **Canonical Lock Ordering (`HD-01`, `HD-02`)**:
      - Every stored procedure executes imperative PL/pgSQL statements in strict hierarchy order:
        `1. flash_sale_campaigns (FOR SHARE or FOR UPDATE) -> 2. flash_sale_claims (ORDER BY claim_id ASC FOR UPDATE) -> 3. flash_sale_items (ORDER BY item_id ASC FOR UPDATE) -> 4. outbox_messages -> 5. idempotency_records`.

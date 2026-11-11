@@ -13,9 +13,5 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../Commerce.BuildingBlocks/Commerce.BuildingBlocks.csproj" />
-    <ProjectReference Include="../../../gateways/api-gateway/Commerce.ApiGateway/Commerce.ApiGateway.csproj" />
-    <ProjectReference Include="../../../services/customer/Commerce.Customer.Api/Commerce.Customer.Api.csproj" />
-    <ProjectReference Include="../../../services/promotion/Commerce.Promotion.Api/Commerce.Promotion.Api.csproj" />
-    <ProjectReference Include="../../../services/notification/Commerce.Notification.Api/Commerce.Notification.Api.csproj" />
   </ItemGroup>
 </Project>

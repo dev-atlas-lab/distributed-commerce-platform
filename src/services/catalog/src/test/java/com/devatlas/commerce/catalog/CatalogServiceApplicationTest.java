@@ -16,8 +16,12 @@ import org.springframework.test.web.servlet.MockMvc;
 @AutoConfigureMockMvc
 class CatalogServiceApplicationTest {
 
+    private final MockMvc mockMvc;
+
     @Autowired
-    private MockMvc mockMvc;
+    CatalogServiceApplicationTest(MockMvc mockMvc) {
+        this.mockMvc = mockMvc;
+    }
 
     @Test
     void shouldExposeLivenessAndReadinessProbesWithCorrelationHeader() throws Exception {

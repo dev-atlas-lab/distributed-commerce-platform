@@ -1,15 +1,15 @@
-"""Shared cross-cutting foundations for Python services/workers (M0.3 Foundation)."""
+"""Shared cross-cutting foundations for Python services/workers (M0.3.1 Foundation)."""
 
 from __future__ import annotations
 
 import os
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from datetime import UTC, datetime
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
-from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 
 CORRELATION_ID_HEADER = "X-Correlation-Id"
 
@@ -32,7 +32,7 @@ class CorrelationIdMiddleware(BaseHTTPMiddleware):
     """Propagates or generates X-Correlation-Id header on every HTTP request (NFR-OBS-001)."""
 
     async def dispatch(
-        self, request: Request, call_next: Callable[[Request], Response]
+        self, request: Request, call_next: RequestResponseEndpoint
     ) -> Response:
         correlation_id = request.headers.get(CORRELATION_ID_HEADER) or str(uuid.uuid4())
         request.state.correlation_id = correlation_id

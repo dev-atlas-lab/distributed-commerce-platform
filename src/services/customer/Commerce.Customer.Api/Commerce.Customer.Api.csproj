@@ -2,5 +2,6 @@
   <ItemGroup>
     <ProjectReference Include="../../../building-blocks/dotnet/Commerce.BuildingBlocks/Commerce.BuildingBlocks.csproj" />
     <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.4" />
+    <PackageReference Include="Microsoft.OpenApi" Version="2.13.0" />
   </ItemGroup>
 </Project>
