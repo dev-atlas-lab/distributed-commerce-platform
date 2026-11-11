@@ -2,9 +2,9 @@
 
 - **Repository:** `dev-atlas-lab/distributed-commerce-platform`
 - **Organization:** [dev-atlas-lab](https://github.com/dev-atlas-lab)
-- **Milestone:** `M0.2.1 — Final Architecture Challenge Corrections (CH-01 to CH-07)`
-- **Status:** `ACCEPTED` (Core Decisions `Q1–Q7` Accepted; `CH-01`, `CH-05`, `CH-07` Direction Approved Pending Final Validation; `CH-02`, `CH-03`, `CH-04`, `CH-06` Final Corrections `PROPOSED`)
-- **Last Updated:** 2026-11-10
+- **Milestone:** `M0.2.2 — Adversarial Architecture Verification & Final Sign-off Preparation`
+- **Status:** `ACCEPTED` (Core Decisions `Q1–Q7` Accepted; `CH-01`–`CH-07` Adversarially Verified in [`M0_2_2_ARCHITECTURE_VERIFICATION_REPORT.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_2_ARCHITECTURE_VERIFICATION_REPORT.md) — Pending Final Sign-Off)
+- **Last Updated:** 2026-11-11
 
 ---
 
@@ -37,6 +37,7 @@ distributed-commerce-platform/
 ├── PROJECT_CONSTITUTION.md
 ├── README.md
 ├── SPEC.md
+├── M0_2_2_ARCHITECTURE_VERIFICATION_REPORT.md
 ├── ENGINEERING_ROADMAP.md
 ├── BACKLOG.md
 ├── docs/
@@ -45,6 +46,7 @@ distributed-commerce-platform/
 │   ├── domain/
 │   │   └── DOMAIN_MODEL.md
 │   ├── architecture/
+│   │   ├── ARCHITECTURE_CHALLENGE_M0_1.md
 │   │   ├── SYSTEM_ARCHITECTURE.md
 │   │   ├── SERVICE_BOUNDARIES.md
 │   │   ├── DATA_ARCHITECTURE.md

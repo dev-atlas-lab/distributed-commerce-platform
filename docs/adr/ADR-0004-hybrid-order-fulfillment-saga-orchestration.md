@@ -17,12 +17,12 @@ Completing an e-commerce order coordinates state across `Order`, `Inventory`, `P
    - `Order Service` orchestrates the transactional checkout Saga (`order_saga_states`), while `Notification Service` and search read-models subscribe via Event Choreography.
 2. **Refined `M0.2.1` Order & Payment State Machines (`PROPOSED` — See [`ARCHITECTURE_CHALLENGE_M0_1.md#ch-02`](file:///home/anhltn/projects/distributed-commerce-platform/docs/architecture/ARCHITECTURE_CHALLENGE_M0_1.md))**:
    - **No Scalar Ranks**: State changes are validated strictly against explicit `(CurrentState, CommandOrWebhookEvent) -> NextState` transition tables.
-   - **Recorded Fact Timestamps**: `payment_attempts` records `authorized_at`, `captured_at`, `voided_at`, `refunded_at`, and `failed_at` alongside `status`.
-   - **Out-of-Order Webhook Resolution**: If `payment.captured` arrives while `INITIATED`, the attempt transitions `INITIATED -> CAPTURED` (setting both `authorized_at` and `captured_at`) and emits `PaymentCaptured` in the same local transaction. When the delayed `payment.authorized` webhook arrives while `status == CAPTURED`, the explicit `(CAPTURED, ON_WEBHOOK_AUTHORIZED)` rule records `authorized_at` if needed and performs an idempotent `NOOP` with zero duplicate Outbox events.
-   - **Branch Conflict & Late Capture Protection**:
+   - **Provider-Reported Fact Timestamps (Never Fabricated)**: `payment_attempts` records `provider_authorized_at`, `provider_captured_at`, `provider_voided_at`, `provider_refunded_at`, and `provider_failed_at` strictly when reported by the provider. A direct `payment.captured` event sets **only** `provider_captured_at` (`provider_authorized_at` remains `NULL` unless an actual `payment.authorized` event arrives).
+   - **Out-of-Order & Duplicate Webhook Resolution**: Webhooks are deduplicated via `payment_webhook_logs (provider_event_id PK)` inside the same local DB transaction as the `PaymentAttempt` update and Outbox insert. When a delayed `payment.authorized` webhook arrives while `status == CAPTURED`, the explicit `(CAPTURED, ON_WEBHOOK_AUTHORIZED)` rule records `provider_authorized_at` and performs an idempotent `NOOP` with zero duplicate Outbox events.
+   - **Branch Conflict & Late Capture Idempotent Auto-Refund**:
      - Once `Order` is `EXPIRED` or `CANCELLED`, it never transitions to `CONFIRMED`.
      - Late `PaymentAuthorized` on an `EXPIRED` order triggers `VoidPaymentCommand` (`AUTHORIZED -> VOID_PENDING -> VOIDED`).
-     - Late `PaymentCaptured` on an `EXPIRED` order (or a gateway race where `payment.captured` arrives on a `VOID_PENDING`/`VOIDED` attempt) transitions the attempt to `REFUND_PENDING -> REFUNDED` and the order to `EXPIRED_REFUNDING -> EXPIRED_REFUNDED`.
+     - Late `PaymentCaptured` on an `EXPIRED` order (or a gateway race where `payment.captured` arrives on a `VOID_PENDING`/`VOIDED` attempt) inserts an idempotent row in `refund_requests (UNIQUE (attempt_id, reason_code))` and transitions the attempt to `REFUND_PENDING -> REFUNDED`.
 
 ## 4. Consequences & Trade-offs
 - **Positive**: Accurately models mutually exclusive `CAPTURE` vs. `VOID` branches; handles out-of-order and late webhooks deterministically without scalar rank bugs or clock buffers.

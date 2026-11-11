@@ -23,13 +23,13 @@ To engineer the `pgvector` RAG store (`ai_agent_db`) accurately (`CH-06`), we mu
    - `ai-agent-service` connects ONLY to `ai_agent_db`, never to business databases, Redis, or Kafka, and binds caller identity strictly from the verified JWT (`sub`).
 2. **Refined `M0.2.1` `pgvector` Storage, Indexing & Migration Architecture (`PROPOSED` — See [`ARCHITECTURE_CHALLENGE_M0_1.md#ch-06`](file:///home/anhltn/projects/distributed-commerce-platform/docs/architecture/ARCHITECTURE_CHALLENGE_M0_1.md))**:
    - **Database-Enforced ANN Index Ceiling (`INV-EMB-02`)**: `embedding_index_generations` enforces `CHECK ((index_storage_type = 'VECTOR_FP32' AND dimensions <= 2000) OR (index_storage_type = 'HALFVEC_FP16' AND dimensions <= 4000))`.
-   - **Half-Precision (`halfvec`) Indexing**: `chunk_embeddings` stores vectors and builds per-generation partial functional HNSW indexes (`USING hnsw ((embedding::halfvec(D)) halfvec_cosine_ops) WHERE generation_id = '...'`), supporting `384`, `768`, `1024`, `1536`, and `3072` dimensions natively with `~99.8%+` recall retention and `50%` RAM savings on our `3.8 GiB` VM.
+   - **Half-Precision (`halfvec`) Indexing & Benchmark Targets**: `chunk_embeddings` stores vectors and builds per-generation partial functional HNSW indexes (`USING hnsw ((embedding::halfvec(D)) halfvec_cosine_ops) WHERE generation_id = '...'`), supporting `384`, `768`, `1024`, `1536`, and `3072` dimensions natively with `50%` tuple storage reduction (`2` bytes/dim vs `4` bytes/dim). Recall (`Recall@10 >= 0.95`) and latency (`p95 < 50ms`) are tracked as empirical benchmark targets (`NEEDS_EVIDENCE`) to be measured on our actual catalog in `M5/M7`, never assumed as universal guarantees.
    - **Strict Model-Generation Isolation (`INV-EMB-01`)**: Every RAG similarity query filters `WHERE generation_id = :activeGenId` and encodes the user query with the exact `(provider, model_name, model_version, dimensions)` of that active generation.
    - **Zero-Downtime Blue/Green Migration (`INV-EMB-03`)**: New generations are populated and HNSW-indexed in `BUILDING` state while live traffic reads the `ACTIVE` generation, flipping atomically once `100%` indexed.
 
 ## 4. Consequences & Trade-offs
-- **Positive**: Respects real PostgreSQL `pgvector` HNSW/IVFFlat page-size limits; supports `3072d` models via `halfvec_cosine_ops` without index creation failures; cuts vector index RAM in half.
-- **Negative / Cost**: FP16 (`halfvec`) has 10 mantissa bits vs. FP32's 23 mantissa bits (`<0.2%` top-10 recall difference on normalized unit embeddings, with optional FP32 `vector_cosine_ops` available for any generation $\le 2000$ dimensions).
+- **Positive**: Respects real PostgreSQL `pgvector` HNSW/IVFFlat page-size limits (`2000d` for `vector`, `4000d` for `halfvec`); supports `3072d` models via `halfvec_cosine_ops` without index creation failures; cuts vector tuple storage in half.
+- **Negative / Cost**: FP16 (`halfvec`) has 10 mantissa bits vs. FP32's 23 mantissa bits (requiring empirical `Recall@10` verification in `M5`, with optional FP32 `vector_cosine_ops` available for any generation $\le 2000$ dimensions).
 
 ## 5. Rejected Alternatives
 - **Option B (Assuming `vector(3072)` works with standard `vector_cosine_ops` HNSW)**: Fails in PostgreSQL `pgvector` with `ERROR: column cannot have more than 2000 dimensions for hnsw index`.

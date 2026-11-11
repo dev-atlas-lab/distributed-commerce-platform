@@ -32,6 +32,7 @@ A production-oriented polyglot distributed e-commerce and high-concurrency **Fla
 
 - **Governance & Constitution**: [`PROJECT_CONSTITUTION.md`](file:///home/anhltn/projects/distributed-commerce-platform/PROJECT_CONSTITUTION.md) | [`AGENTS.md`](file:///home/anhltn/projects/distributed-commerce-platform/AGENTS.md)
 - **Master Technical Specification**: [`SPEC.md`](file:///home/anhltn/projects/distributed-commerce-platform/SPEC.md)
+- **M0.2.2 Adversarial Architecture Verification Report**: [`M0_2_2_ARCHITECTURE_VERIFICATION_REPORT.md`](file:///home/anhltn/projects/distributed-commerce-platform/M0_2_2_ARCHITECTURE_VERIFICATION_REPORT.md)
 - **Product Requirements (PRD)**: [`docs/product/PRODUCT_REQUIREMENTS.md`](file:///home/anhltn/projects/distributed-commerce-platform/docs/product/PRODUCT_REQUIREMENTS.md)
 - **Domain-Driven Design Model**: [`docs/domain/DOMAIN_MODEL.md`](file:///home/anhltn/projects/distributed-commerce-platform/docs/domain/DOMAIN_MODEL.md)
 - **System Architecture & 21 Pattern Evaluations**: [`docs/architecture/SYSTEM_ARCHITECTURE.md`](file:///home/anhltn/projects/distributed-commerce-platform/docs/architecture/SYSTEM_ARCHITECTURE.md)

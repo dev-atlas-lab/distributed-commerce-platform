@@ -21,9 +21,10 @@ In our 9-service polyglot platform (`Java 21`, `.NET 10`, `Python 3.12+`, `React
 2. **Validated `M0.2.1` Specifications (`PROPOSED` — See [`ARCHITECTURE_CHALLENGE_M0_1.md#ch-07`](file:///home/anhltn/projects/distributed-commerce-platform/docs/architecture/ARCHITECTURE_CHALLENGE_M0_1.md))**:
    - **Outbox/Inbox Trace Continuity (`INV-OBS-01`)**: `outbox_messages.headers` stores W3C `traceparent` and `tracestate`. Each Kafka publish span restores the message's `traceparent` as its parent and attaches a **SpanLink** to the `outbox.relay.batch` poll span.
    - **W3C Baggage Is Never Authorization (`INV-OBS-02`)**: Gateway enforces a strict `baggage` key allowlist (`correlation.id`, `test.run_id`, `fault.profile_id`), strips all other keys, and prohibits services from reading identity, roles, or PII from `baggage`.
-   - **Server-Registered Fault Profiles & Production Exclusion (`INV-OBS-03`)**:
+   - **Server-Registered Fault Profiles & Fail-Closed Production Exclusion (`INV-OBS-03`)**:
+     - **Fail-Closed Startup Guard**: If `ENVIRONMENT == 'production'` (or `PRODUCTION_LOCK == 'true'`) and `FAULT_INJECTION_ENABLED == 'true'`, the application throws `FatalSecurityConfigurationException` and **aborts startup immediately**.
      - Fault injection is completely unavailable in production (`FAULT_INJECTION_ENABLED=false` excludes the interceptor/beans from DI registration at startup).
-     - When enabled in non-prod chaos environments (`FAULT_INJECTION_ENABLED=true`), callers must present a verified `ADMIN_OPS` JWT with `scope: "chaos:inject"` and can only reference pre-configured **Server-Side Fault Profile IDs** (`fault-profiles.yaml`) that enforce target service/endpoint allowlists and duration caps, emitting a mandatory `CHAOS_FAULT_PROFILE_ACTIVATED` audit log.
+     - When enabled in non-prod chaos environments (`FAULT_INJECTION_ENABLED=true` and `ENVIRONMENT IN ('development', 'test', 'chaos')`), callers must present a verified `HUMAN_PRINCIPAL` `ADMIN_OPS` JWT with `scope: "chaos:inject"` and can only reference pre-configured **Server-Side Fault Profile IDs** (`fault-profiles.yaml`) that enforce target service/endpoint allowlists and duration caps, emitting a mandatory `CHAOS_FAULT_PROFILE_ACTIVATED` audit log.
 
 ## 4. Consequences & Trade-offs
 - **Positive**: Complete end-to-end Saga trace visibility in Tempo; zero PII leakage via W3C baggage; zero arbitrary fault-injection attack surface.
