@@ -40,6 +40,8 @@ public static class PlatformServiceExtensions
 
         services.AddHostedService<FaultInjectionStartupGuard>();
 
+        services.AddExceptionHandler<GlobalExceptionHandler>();
+
         return services;
     }
 

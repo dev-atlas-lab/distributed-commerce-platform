@@ -1,0 +1,217 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "version": "1.0.0",
+  "description": "Canonical cross-language error code catalog for Distributed Commerce Platform",
+  "errorCodes": [
+    {
+      "code": "INVALID_ARGUMENT",
+      "category": "ValidationException",
+      "httpStatus": 400,
+      "description": "General invalid request parameter or malformed argument."
+    },
+    {
+      "code": "INVALID_MONEY_AMOUNT",
+      "category": "ValidationException",
+      "httpStatus": 400,
+      "description": "Money amount must be strictly greater than zero and conform to currency decimal scale."
+    },
+    {
+      "code": "INVALID_DOMAIN_IDENTIFIER",
+      "category": "ValidationException",
+      "httpStatus": 400,
+      "description": "Domain entity identifier UUID is null or malformed."
+    },
+    {
+      "code": "INVALID_PRODUCT_NAME",
+      "category": "ValidationException",
+      "httpStatus": 400,
+      "description": "Product name is blank or exceeds allowed length constraints."
+    },
+    {
+      "code": "INVALID_PRODUCT_BRAND",
+      "category": "ValidationException",
+      "httpStatus": 400,
+      "description": "Product brand is blank or exceeds allowed length constraints."
+    },
+    {
+      "code": "INVALID_SLUG",
+      "category": "ValidationException",
+      "httpStatus": 400,
+      "description": "Slug format is invalid or contains prohibited characters."
+    },
+    {
+      "code": "INVALID_SKU_CODE",
+      "category": "ValidationException",
+      "httpStatus": 400,
+      "description": "SKU code format does not match required alphanumeric pattern."
+    },
+    {
+      "code": "INVALID_PRODUCT_MEDIA",
+      "category": "ValidationException",
+      "httpStatus": 400,
+      "description": "Product media list violates primary media or ordering invariants."
+    },
+    {
+      "code": "INVALID_COUPON_CODE",
+      "category": "ValidationException",
+      "httpStatus": 400,
+      "description": "Coupon code format is invalid or malformed."
+    },
+    {
+      "code": "INVALID_QUERY",
+      "category": "ValidationException",
+      "httpStatus": 400,
+      "description": "Search or agent query string is blank or invalid."
+    },
+    {
+      "code": "EMPTY_QUERY",
+      "category": "ValidationException",
+      "httpStatus": 400,
+      "description": "Search query cannot be empty."
+    },
+    {
+      "code": "PRODUCT_ARCHIVED",
+      "category": "DomainException",
+      "httpStatus": 409,
+      "description": "Archived product is terminal and cannot be modified or published."
+    },
+    {
+      "code": "PRODUCT_REQUIRES_ACTIVE_VARIANT",
+      "category": "DomainException",
+      "httpStatus": 409,
+      "description": "An active product must maintain at least one active variant."
+    },
+    {
+      "code": "INCONSISTENT_VARIANT_CURRENCY",
+      "category": "DomainException",
+      "httpStatus": 409,
+      "description": "All variants belonging to a product must share the same currency code."
+    },
+    {
+      "code": "IMMUTABLE_SKU_CODE",
+      "category": "DomainException",
+      "httpStatus": 409,
+      "description": "SKU code is immutable once a product has been published."
+    },
+    {
+      "code": "INVALID_AGGREGATE_VERSION",
+      "category": "DomainException",
+      "httpStatus": 409,
+      "description": "Aggregate version cannot be reconstituted with a version less than 1."
+    },
+    {
+      "code": "CAMPAIGN_EXPIRED",
+      "category": "DomainException",
+      "httpStatus": 409,
+      "description": "Flash sale campaign has ended or is no longer active."
+    },
+    {
+      "code": "INSUFFICIENT_CONTEXT_BUDGET",
+      "category": "DomainException",
+      "httpStatus": 409,
+      "description": "AI agent token context budget was exceeded."
+    },
+    {
+      "code": "SESSION_CLOSED",
+      "category": "DomainException",
+      "httpStatus": 409,
+      "description": "AI agent session has been closed."
+    },
+    {
+      "code": "PRODUCT_NOT_FOUND",
+      "category": "NotFoundException",
+      "httpStatus": 404,
+      "description": "Requested product aggregate does not exist."
+    },
+    {
+      "code": "PRODUCT_VARIANT_NOT_FOUND",
+      "category": "NotFoundException",
+      "httpStatus": 404,
+      "description": "Requested variant does not exist on the product."
+    },
+    {
+      "code": "CAMPAIGN_NOT_FOUND",
+      "category": "NotFoundException",
+      "httpStatus": 404,
+      "description": "Requested campaign does not exist."
+    },
+    {
+      "code": "CUSTOMER_NOT_FOUND",
+      "category": "NotFoundException",
+      "httpStatus": 404,
+      "description": "Requested customer does not exist."
+    },
+    {
+      "code": "AGENT_SESSION_NOT_FOUND",
+      "category": "NotFoundException",
+      "httpStatus": 404,
+      "description": "Requested AI agent session does not exist."
+    },
+    {
+      "code": "DUPLICATE_SKU_CODE",
+      "category": "ConflictException",
+      "httpStatus": 409,
+      "description": "SKU code already exists within the product aggregate."
+    },
+    {
+      "code": "CONCURRENCY_CONFLICT",
+      "category": "ConflictException",
+      "httpStatus": 409,
+      "description": "Aggregate version conflict during optimistic concurrency check."
+    },
+    {
+      "code": "ACTIVE_SESSION_CONFLICT",
+      "category": "ConflictException",
+      "httpStatus": 409,
+      "description": "A conflicting active session already exists."
+    },
+    {
+      "code": "DATABASE_ERROR",
+      "category": "InfrastructureException",
+      "httpStatus": 500,
+      "description": "Database connectivity or execution failure."
+    },
+    {
+      "code": "DATABASE_TIMEOUT",
+      "category": "InfrastructureException",
+      "httpStatus": 500,
+      "description": "Database query timed out."
+    },
+    {
+      "code": "DATABASE_CONNECTION_ERROR",
+      "category": "InfrastructureException",
+      "httpStatus": 500,
+      "description": "Failed to establish database connection."
+    },
+    {
+      "code": "REDIS_GATEWAY_TIMEOUT",
+      "category": "InfrastructureException",
+      "httpStatus": 500,
+      "description": "Redis cache or Lua script execution timed out."
+    },
+    {
+      "code": "REDIS_CONNECTION_FAILURE",
+      "category": "InfrastructureException",
+      "httpStatus": 500,
+      "description": "Failed to connect to Redis instance."
+    },
+    {
+      "code": "PGVECTOR_CONNECTION_REFUSED",
+      "category": "InfrastructureException",
+      "httpStatus": 500,
+      "description": "Connection to pgvector store was refused."
+    },
+    {
+      "code": "PGVECTOR_SEARCH_ERROR",
+      "category": "InfrastructureException",
+      "httpStatus": 500,
+      "description": "Vector similarity search failed."
+    },
+    {
+      "code": "INTERNAL_SERVER_ERROR",
+      "category": "InfrastructureException",
+      "httpStatus": 500,
+      "description": "Unexpected internal server failure."
+    }
+  ]
+}

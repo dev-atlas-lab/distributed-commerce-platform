@@ -275,13 +275,13 @@ stateDiagram-v2
 | `DRAFT` or `ACTIVE` | `addVariant(skuId, skuCode, attributes, basePrice, status, now)` | Unchanged | Product is not `ARCHIVED`; `skuId` and `skuCode` are not already present on this `Product` (`INV-PRD-2a`); `basePrice.currency()` matches the `CurrencyCode` of existing variants on this `Product` (`OQ-CAT-002`). | Adds `ProductVariant`, sets `updatedAt = now`, increments `aggregateVersion` by `+1`, records `ProductVariantAdded`. |
 | `DRAFT` or `ACTIVE` | `updateVariantPrice(skuId, newPrice, now)` | Unchanged | Product is not `ARCHIVED`; variant `skuId` exists; `newPrice` valid per `INV-PRD-3`; `newPrice.currency()` matches the product's variant `CurrencyCode` (`OQ-CAT-002`). | **If `newPrice.equals(currentPrice)` (`OQ-CAT-004`)**: **idempotent no-op** (returns immediately without incrementing `aggregateVersion`, modifying `updatedAt`, or emitting an event).<br>**If `newPrice` differs**: updates variant `basePrice`, sets `updatedAt = now`, increments `aggregateVersion` by `+1`, records `ProductVariantPriceChanged`. |
 | `DRAFT` | `updateVariantSkuCode(skuId, newSkuCode, now)` | `DRAFT` | Allowed **only** if `everPublished == false` (`INV-PRD-2b`) and `newSkuCode` is not used by another variant in this `Product` (`INV-PRD-2a`). | If `newSkuCode` equals current `skuCode`: idempotent no-op. Otherwise updates variant `skuCode`, sets `updatedAt = now`, increments `aggregateVersion` by `+1`, records `ProductDetailsUpdated`. |
-| `ACTIVE` | `updateVariantSkuCode(...)` | *(Rejected)* | Violates `INV-PRD-2b` (`everPublished == true`). | Throws `ImmutableSkuCodeException`. |
+| `ACTIVE` | `updateVariantSkuCode(...)` | *(Rejected)* | Violates `INV-PRD-2b` (`everPublished == true`). | Throws `DomainException("IMMUTABLE_SKU_CODE", ...)`. |
 | `DRAFT` or `ACTIVE` | `activateVariant(skuId, now)` | Unchanged | Product is not `ARCHIVED`; variant `skuId` exists. | If variant is already `ACTIVE`: idempotent no-op. If `INACTIVE`: transitions variant to `ACTIVE`, sets `updatedAt = now`, increments `aggregateVersion` by `+1`, records `ProductVariantStatusChanged`. |
-| `DRAFT` or `ACTIVE` | `deactivateVariant(skuId, now)` | Unchanged | Product is not `ARCHIVED`; variant `skuId` exists. **If `Product.status == ACTIVE`, at least one *other* variant must remain `ACTIVE` (`INV-PRD-1`, `OQ-CAT-003`).** | If variant is already `INACTIVE`: idempotent no-op. If `Product.status == ACTIVE` and this is the last `ACTIVE` variant: **throws `ActiveProductRequiresActiveVariantException` (never reverts `Product` to `DRAFT`)**. Otherwise sets variant `status = INACTIVE`, sets `updatedAt = now`, increments `aggregateVersion` by `+1`, records `ProductVariantStatusChanged`. |
+| `DRAFT` or `ACTIVE` | `deactivateVariant(skuId, now)` | Unchanged | Product is not `ARCHIVED`; variant `skuId` exists. **If `Product.status == ACTIVE`, at least one *other* variant must remain `ACTIVE` (`INV-PRD-1`, `OQ-CAT-003`).** | If variant is already `INACTIVE`: idempotent no-op. If `Product.status == ACTIVE` and this is the last `ACTIVE` variant: **throws `DomainException("PRODUCT_REQUIRES_ACTIVE_VARIANT", ...)` (never reverts `Product` to `DRAFT`)**. Otherwise sets variant `status = INACTIVE`, sets `updatedAt = now`, increments `aggregateVersion` by `+1`, records `ProductVariantStatusChanged`. |
 | `DRAFT` | `activate(now)` | `ACTIVE` | Product has at least 1 `ProductVariant` with `status == VariantStatus.ACTIVE` (`INV-PRD-1`). | Sets `status = ACTIVE`, `everPublished = true`, `updatedAt = now`, increments `aggregateVersion` by `+1`, records `ProductActivated`. |
 | `ACTIVE` | `activate(now)` | `ACTIVE` | Product is already `ACTIVE`. | **Idempotent no-op** (no version bump, no event). |
 | `DRAFT` or `ACTIVE` | `archive(now)` | `ARCHIVED` | Product is not already `ARCHIVED`. | Sets `status = ARCHIVED`, `updatedAt = now`, increments `aggregateVersion` by `+1`, records `ProductArchived`. |
-| `ARCHIVED` | Any mutating operation (`updateDetails`, `addVariant`, `updateVariantPrice`, `activate`, `archive`, etc.) | *(Rejected)* | `ARCHIVED` is strictly terminal (`OQ-CAT-001`). No unarchive operation exists. | Throws `ArchivedProductModificationException`. |
+| `ARCHIVED` | Any mutating operation (`updateDetails`, `addVariant`, `updateVariantPrice`, `activate`, `archive`, etc.) | *(Rejected)* | `ARCHIVED` is strictly terminal (`OQ-CAT-001`). No unarchive operation exists. | Throws `DomainException("PRODUCT_ARCHIVED", ...)`. |
 
 ---
 
@@ -289,21 +289,21 @@ stateDiagram-v2
 
 ### 7.1 Complete Invariant & Validation Matrix
 
-| Rule ID | Target | Rule / Invariant Specification | Invalid Input / State | Domain Exception Thrown |
+| Rule ID | Target | Rule / Invariant Specification | Invalid Input / State | Generic Exception & Error Code Thrown (`ADR-0012`) |
 | :--- | :--- | :--- | :--- | :--- |
-| **`INV-PRD-1`** | `Product` + `ProductVariant` | Every `ACTIVE` `Product` must have $\ge 1$ `ACTIVE` `ProductVariant` (`OQ-CAT-003`). | Calling `product.activate()` with 0 variants or only `INACTIVE` variants; calling `product.deactivateVariant(skuId)` on the last `ACTIVE` variant of an `ACTIVE` product. | `ActiveProductRequiresActiveVariantException` |
-| **`INV-PRD-2a`** | `Product` + `SkuCode` | **Within-Aggregate SKU Uniqueness**: `SkuCode` must be unique across all variants belonging to the same `Product` aggregate. *(Global SKU uniqueness across different `Product` aggregates is enforced at the `Application`/`Infrastructure` persistence boundary, not claimed by the `Product` aggregate alone.)* | Calling `addVariant` or `updateVariantSkuCode` with a `SkuCode` already used by another variant in the same `Product` (or duplicate `SkuId`). | `DuplicateSkuCodeException` |
-| **`INV-PRD-2b`** | `ProductVariant` | **Post-Publication SKU Immutability**: `SkuCode` is immutable once the product has been published (`everPublished == true`). | Attempting to change a variant's `SkuCode` when `status == ACTIVE` or `everPublished == true`. | `ImmutableSkuCodeException` |
-| **`INV-PRD-3`** | `Money` | `Money.amount` must be strictly $> 0$ (`amount.compareTo(BigDecimal.ZERO) > 0`) and scale $\le 2$ for `USD` or $\le 0$ for `VND`. | `amount == null`, `amount <= 0`, `amount = 19.999` (`USD`), or `amount = 100.5` (`VND`). | `InvalidMoneyAmountException` |
-| **`OQ-CAT-002`** | `Product` + `ProductVariant` | **Single-Product Currency Uniformity**: All `ProductVariant`s belonging to one `Product` must use the same `CurrencyCode` (traceable to `INV-PRD-3` & `PRODUCT_REQUIREMENTS.md` Section 6.2). | Calling `addVariant` or `updateVariantPrice` with a `Money` whose `CurrencyCode` differs from existing variants on the same `Product`. | `InconsistentVariantCurrencyException` |
-| **`VAL-PRD-1`** | `ProductId`, `CategoryId`, `SkuId`, `MediaId` | Identifier `UUID` must not be `null`. | Passing `null` to ID constructor. | `InvalidDomainIdentifierException` (or subclass of `CatalogDomainException`) |
-| **`VAL-PRD-2`** | `Product.name` | Trimmed product name must be non-blank and between `2` and `255` characters. | `null`, `""`, `"   "`, `"A"`, or $> 255$ chars. | `InvalidProductNameException` |
-| **`VAL-PRD-3`** | `Product.brand` | Trimmed brand name must be non-blank and between `1` and `128` characters. | `null`, `""`, `"   "`, or $> 128$ chars. | `InvalidProductBrandException` |
-| **`VAL-PRD-4`** | `Slug` | Must match `^[a-z0-9]+(-[a-z0-9]+)*$` and length `2..128`. | Uppercase letters, spaces, leading/trailing/double hyphens, empty string. | `InvalidSlugException` |
-| **`VAL-PRD-5`** | `SkuCode` | Trimmed uppercase string matching `^[A-Z0-9][A-Z0-9_-]{2,63}$` (`3..64` chars). | `null`, blank, `< 3` chars, `> 64` chars, special characters (`@`, `/`, whitespace). | `InvalidSkuCodeException` |
-| **`VAL-PRD-6`** | `ProductMedia` list | When media list is non-empty, **exactly one** item must have `isPrimary == true`, `MediaId`s and `objectKey`s must be unique within the product, and `displayOrder` must be $\ge 0$. | 0 primary media items when media list is non-empty, $\ge 2$ primary media items, negative `displayOrder`, blank `objectKey`. | `InvalidProductMediaException` |
-| **`VAL-PRD-7`** | `Product.aggregateVersion` | Starts at `1L` upon creation; increments by `+1L` **only when an actual aggregate state transition occurs** (`CH-04`, `OQ-CAT-004`). Idempotent no-ops must not increment `aggregateVersion` or emit a domain event. `pullDomainEvents()` drains and clears the internal event buffer. | `reconstitute` called with `aggregateVersion < 1L`. | `CatalogDomainException` |
-| **`VAL-PRD-8`** | `Product` (`ARCHIVED`) | `ARCHIVED` is strictly terminal (`OQ-CAT-001`). An `ARCHIVED` product cannot be mutated or unarchived. | Calling `updateDetails`, `addVariant`, `updateVariantPrice`, `replaceMedia`, `activate`, or `archive` on an `ARCHIVED` product. | `ArchivedProductModificationException` |
+| **`INV-PRD-1`** | `Product` + `ProductVariant` | Every `ACTIVE` `Product` must have $\ge 1$ `ACTIVE` `ProductVariant` (`OQ-CAT-003`). | Calling `product.activate()` with 0 variants or only `INACTIVE` variants; calling `product.deactivateVariant(skuId)` on the last `ACTIVE` variant of an `ACTIVE` product. | `DomainException("PRODUCT_REQUIRES_ACTIVE_VARIANT", ...)` |
+| **`INV-PRD-2a`** | `Product` + `SkuCode` | **Within-Aggregate SKU Uniqueness**: `SkuCode` must be unique across all variants belonging to the same `Product` aggregate. *(Global SKU uniqueness across different `Product` aggregates is enforced at the `Application`/`Infrastructure` persistence boundary, not claimed by the `Product` aggregate alone.)* | Calling `addVariant` or `updateVariantSkuCode` with a `SkuCode` already used by another variant in the same `Product` (or duplicate `SkuId`). | `ConflictException("DUPLICATE_SKU_CODE", ...)` |
+| **`INV-PRD-2b`** | `ProductVariant` | **Post-Publication SKU Immutability**: `SkuCode` is immutable once the product has been published (`everPublished == true`). | Attempting to change a variant's `SkuCode` when `status == ACTIVE` or `everPublished == true`. | `DomainException("IMMUTABLE_SKU_CODE", ...)` |
+| **`INV-PRD-3`** | `Money` | `Money.amount` must be strictly $> 0$ (`amount.compareTo(BigDecimal.ZERO) > 0`) and scale $\le 2$ for `USD` or $\le 0$ for `VND`. | `amount == null`, `amount <= 0`, `amount = 19.999` (`USD`), or `amount = 100.5` (`VND`). | `ValidationException("INVALID_MONEY_AMOUNT", ...)` |
+| **`OQ-CAT-002`** | `Product` + `ProductVariant` | **Single-Product Currency Uniformity**: All `ProductVariant`s belonging to one `Product` must use the same `CurrencyCode` (traceable to `INV-PRD-3` & `PRODUCT_REQUIREMENTS.md` Section 6.2). | Calling `addVariant` or `updateVariantPrice` with a `Money` whose `CurrencyCode` differs from existing variants on the same `Product`. | `DomainException("INCONSISTENT_VARIANT_CURRENCY", ...)` |
+| **`VAL-PRD-1`** | `ProductId`, `CategoryId`, `SkuId`, `MediaId` | Identifier `UUID` must not be `null`. | Passing `null` to ID constructor. | `ValidationException("INVALID_DOMAIN_IDENTIFIER", ...)` |
+| **`VAL-PRD-2`** | `Product.name` | Trimmed product name must be non-blank and between `2` and `255` characters. | `null`, `""`, `"   "`, `"A"`, or $> 255$ chars. | `ValidationException("INVALID_PRODUCT_NAME", ...)` |
+| **`VAL-PRD-3`** | `Product.brand` | Trimmed brand name must be non-blank and between `1` and `128` characters. | `null`, `""`, `"   "`, or $> 128$ chars. | `ValidationException("INVALID_PRODUCT_BRAND", ...)` |
+| **`VAL-PRD-4`** | `Slug` | Must match `^[a-z0-9]+(-[a-z0-9]+)*$` and length `2..128`. | Uppercase letters, spaces, leading/trailing/double hyphens, empty string. | `ValidationException("INVALID_SLUG", ...)` |
+| **`VAL-PRD-5`** | `SkuCode` | Trimmed uppercase string matching `^[A-Z0-9][A-Z0-9_-]{2,63}$` (`3..64` chars). | `null`, blank, `< 3` chars, `> 64` chars, special characters (`@`, `/`, whitespace). | `ValidationException("INVALID_SKU_CODE", ...)` |
+| **`VAL-PRD-6`** | `ProductMedia` list | When media list is non-empty, **exactly one** item must have `isPrimary == true`, `MediaId`s and `objectKey`s must be unique within the product, and `displayOrder` must be $\ge 0$. | 0 primary media items when media list is non-empty, $\ge 2$ primary media items, negative `displayOrder`, blank `objectKey`. | `ValidationException("INVALID_PRODUCT_MEDIA", ...)` |
+| **`VAL-PRD-7`** | `Product.aggregateVersion` | Starts at `1L` upon creation; increments by `+1L` **only when an actual aggregate state transition occurs** (`CH-04`, `OQ-CAT-004`). Idempotent no-ops must not increment `aggregateVersion` or emit a domain event. `pullDomainEvents()` drains and clears the internal event buffer. | `reconstitute` called with `aggregateVersion < 1L`. | `DomainException("INVALID_AGGREGATE_VERSION", ...)` |
+| **`VAL-PRD-8`** | `Product` (`ARCHIVED`) | `ARCHIVED` is strictly terminal (`OQ-CAT-001`). An `ARCHIVED` product cannot be mutated or unarchived. | Calling `updateDetails`, `addVariant`, `updateVariantPrice`, `replaceMedia`, `activate`, or `archive` on an `ARCHIVED` product. | `DomainException("PRODUCT_ARCHIVED", ...)` |
 
 ---
 
@@ -314,21 +314,16 @@ All files below belong under `src/services/catalog/src/main/java/com/devatlas/co
 ```text
 src/services/catalog/src/main/java/com/devatlas/commerce/catalog/domain/
 ├── package-info.java
-├── exception/
-│   ├── CatalogDomainException.java                      # Base unchecked domain exception
-│   ├── ActiveProductRequiresActiveVariantException.java # INV-PRD-1, OQ-CAT-003
-│   ├── DuplicateSkuCodeException.java                   # INV-PRD-2a (within-Product uniqueness)
-│   ├── ImmutableSkuCodeException.java                   # INV-PRD-2b (post-publication immutability)
-│   ├── InvalidMoneyAmountException.java                 # INV-PRD-3
-│   ├── InconsistentVariantCurrencyException.java        # OQ-CAT-002 (single-Product currency uniformity)
-│   ├── ArchivedProductModificationException.java        # VAL-PRD-8, OQ-CAT-001 (terminal ARCHIVED)
-│   ├── ProductVariantNotFoundException.java
-│   ├── InvalidDomainIdentifierException.java
-│   ├── InvalidProductNameException.java
-│   ├── InvalidProductBrandException.java
-│   ├── InvalidSlugException.java
-│   ├── InvalidSkuCodeException.java
-│   └── InvalidProductMediaException.java
+├── exception/ (REMOVED — replaced by com.devatlas.commerce.common.error taxonomy per ADR-0012)
+│   # Domain uses generic taxonomy with stable machine-readable error codes:
+│   # - DomainException("PRODUCT_ARCHIVED", ...)
+│   # - DomainException("INCONSISTENT_VARIANT_CURRENCY", ...)
+│   # - DomainException("PRODUCT_REQUIRES_ACTIVE_VARIANT", ...)
+│   # - DomainException("IMMUTABLE_SKU_CODE", ...)
+│   # - ConflictException("DUPLICATE_SKU_CODE", ...)
+│   # - ValidationException("INVALID_MONEY_AMOUNT", ...)
+│   # - ValidationException("INVALID_DOMAIN_IDENTIFIER" | "INVALID_PRODUCT_NAME" | "INVALID_SLUG" | "INVALID_SKU_CODE" | "INVALID_PRODUCT_MEDIA", ...)
+│   # - NotFoundException("PRODUCT_VARIANT_NOT_FOUND", ...)
 └── product/
     ├── Product.java                                     # Aggregate Root
     ├── ProductVariant.java                              # Child Entity (SKU)
@@ -361,7 +356,7 @@ src/services/catalog/src/main/java/com/devatlas/commerce/catalog/domain/
 > `ProductRepository` is **NOT** placed in `com.devatlas.commerce.catalog.domain`. It belongs in `com.devatlas.commerce.catalog.application` (to be implemented in the Application milestone) alongside use cases and input/output models.
 >
 > **Note on Exception Mapping to RFC 9457 `ProblemDetails`:**
-> Domain exceptions extend `CatalogDomainException extends RuntimeException` and contain **zero** HTTP status codes or Spring annotations. Mapping `ActiveProductRequiresActiveVariantException` or `DuplicateSkuCodeException` to `409 Conflict` or `422 Unprocessable Entity` is the responsibility of the `api` layer exception translator (`@RestControllerAdvice`).
+> Domain exceptions use the generic taxonomy (`DomainException`, `ValidationException`, `NotFoundException`, `ConflictException`) from `com.devatlas.commerce.common.error` per `ADR-0012` and contain **zero** HTTP status codes or Spring annotations. Mapping `DomainException("PRODUCT_REQUIRES_ACTIVE_VARIANT")` or `ConflictException("DUPLICATE_SKU_CODE")` to `409 Conflict` and `ValidationException` to `400 Bad Request` is handled uniformly by `GlobalProblemDetailsExceptionHandler` in `commerce-building-blocks`.
 
 ---
 
@@ -372,26 +367,26 @@ All unit tests must live under `src/services/catalog/src/test/java/com/devatlas/
 | Test ID | Target Class | Scenario | Input / Action | Expected Outcome |
 | :--- | :--- | :--- | :--- | :--- |
 | **`UT-PRD-001`** | `Money` | Valid `USD` and `VND` amounts (`INV-PRD-3`) | `Money.of(new BigDecimal("199.99"), CurrencyCode.USD)` and `Money.of(new BigDecimal("250000"), CurrencyCode.VND)` | Constructed cleanly; normalized scale preserved; value equality holds for `199.9` vs `199.90`. |
-| **`UT-PRD-002`** | `Money` | Reject zero or negative amount (`INV-PRD-3`) | `Money.of(BigDecimal.ZERO, CurrencyCode.USD)` and `Money.of(new BigDecimal("-0.01"), CurrencyCode.USD)` | Throws `InvalidMoneyAmountException`. |
-| **`UT-PRD-003`** | `Money` | Reject excessive decimal scale (`INV-PRD-3`) | `Money.of(new BigDecimal("10.999"), CurrencyCode.USD)` and `Money.of(new BigDecimal("1000.5"), CurrencyCode.VND)` | Throws `InvalidMoneyAmountException`. |
+| **`UT-PRD-002`** | `Money` | Reject zero or negative amount (`INV-PRD-3`) | `Money.of(BigDecimal.ZERO, CurrencyCode.USD)` and `Money.of(new BigDecimal("-0.01"), CurrencyCode.USD)` | Throws `ValidationException("INVALID_MONEY_AMOUNT", ...)`. |
+| **`UT-PRD-003`** | `Money` | Reject excessive decimal scale (`INV-PRD-3`) | `Money.of(new BigDecimal("10.999"), CurrencyCode.USD)` and `Money.of(new BigDecimal("1000.5"), CurrencyCode.VND)` | Throws `ValidationException("INVALID_MONEY_AMOUNT", ...)`. |
 | **`UT-PRD-004`** | `SkuCode` | Valid normalization & format check | `SkuCode.of(" iphone-16-pro_256gb ")` | Normalized to `"IPHONE-16-PRO_256GB"`. |
-| **`UT-PRD-005`** | `SkuCode` | Reject invalid SKU codes | `""`, `"AB"` (too short), `"SKU WITH SPACES"`, `"SKU@123"` | Throws `InvalidSkuCodeException`. |
-| **`UT-PRD-006`** | `Slug` | Valid slug creation & invalid slug rejection | `Slug.of("iphone-16-pro")` vs `Slug.of("iPhone 16 Pro")`, `Slug.of("-leading")`, `Slug.of("double--dash")` | Valid succeeds; invalid throws `InvalidSlugException`. |
+| **`UT-PRD-005`** | `SkuCode` | Reject invalid SKU codes | `""`, `"AB"` (too short), `"SKU WITH SPACES"`, `"SKU@123"` | Throws `ValidationException("INVALID_SKU_CODE", ...)`. |
+| **`UT-PRD-006`** | `Slug` | Valid slug creation & invalid slug rejection | `Slug.of("iphone-16-pro")` vs `Slug.of("iPhone 16 Pro")`, `Slug.of("-leading")`, `Slug.of("double--dash")` | Valid succeeds; invalid throws `ValidationException("INVALID_SLUG", ...)`. |
 | **`UT-PRD-007`** | `Product` | Create draft product (`FR-CAT-001`, `CH-04`) | `Product.createDraft(...)` | `status == DRAFT`, `aggregateVersion == 1L`, `variants` empty, `pullDomainEvents()` returns 1 `ProductCreated` event with `aggregateVersion == 1L`, second call to `pullDomainEvents()` returns empty list. |
 | **`UT-PRD-008`** | `Product` | Reconstitute existing product from storage | `Product.reconstitute(..., aggregateVersion = 7L)` | State matches arguments, `aggregateVersion == 7L`, `pullDomainEvents()` is empty. |
 | **`UT-PRD-009`** | `Product` | Add valid SKU variant to `DRAFT` product | `product.addVariant(...)` | Variant added, `aggregateVersion` increments from `1L` to `2L`, `ProductVariantAdded` event recorded with `aggregateVersion == 2L`. |
-| **`UT-PRD-010`** | `Product` | Reject duplicate `SkuCode` within same product (`INV-PRD-2a`) | Call `addVariant` twice with `SkuCode.of("SKU-001")` on the same `Product` | Second call throws `DuplicateSkuCodeException`; `aggregateVersion` remains `2L` and no extra event is emitted. |
-| **`UT-PRD-011`** | `Product` | Reject activating `DRAFT` product with 0 variants (`INV-PRD-1`) | Create draft product -> `product.activate(now)` | Throws `ActiveProductRequiresActiveVariantException`; status remains `DRAFT` and `aggregateVersion` remains `1L`. |
-| **`UT-PRD-012`** | `Product` | Reject activating `DRAFT` product when all variants are `INACTIVE` (`INV-PRD-1`) | Create draft -> add 1 `INACTIVE` variant -> `product.activate(now)` | Throws `ActiveProductRequiresActiveVariantException`; status remains `DRAFT`. |
+| **`UT-PRD-010`** | `Product` | Reject duplicate `SkuCode` within same product (`INV-PRD-2a`) | Call `addVariant` twice with `SkuCode.of("SKU-001")` on the same `Product` | Second call throws `ConflictException("DUPLICATE_SKU_CODE", ...)`; `aggregateVersion` remains `2L` and no extra event is emitted. |
+| **`UT-PRD-011`** | `Product` | Reject activating `DRAFT` product with 0 variants (`INV-PRD-1`) | Create draft product -> `product.activate(now)` | Throws `DomainException("PRODUCT_REQUIRES_ACTIVE_VARIANT", ...)`; status remains `DRAFT` and `aggregateVersion` remains `1L`. |
+| **`UT-PRD-012`** | `Product` | Reject activating `DRAFT` product when all variants are `INACTIVE` (`INV-PRD-1`) | Create draft -> add 1 `INACTIVE` variant -> `product.activate(now)` | Throws `DomainException("PRODUCT_REQUIRES_ACTIVE_VARIANT", ...)`; status remains `DRAFT`. |
 | **`UT-PRD-013`** | `Product` | Activate `DRAFT` product with $\ge 1$ `ACTIVE` variant (`INV-PRD-1`) | Create draft -> add 1 `ACTIVE` variant -> `product.activate(now)` | `status == ACTIVE`, `everPublished == true`, `aggregateVersion == 3L`, `ProductActivated` event recorded. |
-| **`UT-PRD-014`** | `Product` | Prevent deactivating the last `ACTIVE` variant of an `ACTIVE` product (`INV-PRD-1`, `OQ-CAT-003`) | Active product with 1 `ACTIVE` variant -> `product.deactivateVariant(skuId, now)` | Throws `ActiveProductRequiresActiveVariantException`; variant remains `ACTIVE` and `Product` remains `ACTIVE` (never auto-reverts to `DRAFT`). |
+| **`UT-PRD-014`** | `Product` | Prevent deactivating the last `ACTIVE` variant of an `ACTIVE` product (`INV-PRD-1`, `OQ-CAT-003`) | Active product with 1 `ACTIVE` variant -> `product.deactivateVariant(skuId, now)` | Throws `DomainException("PRODUCT_REQUIRES_ACTIVE_VARIANT", ...)`; variant remains `ACTIVE` and `Product` remains `ACTIVE` (never auto-reverts to `DRAFT`). |
 | **`UT-PRD-015`** | `Product` | Allow deactivating one `ACTIVE` variant when another `ACTIVE` variant remains | Active product with 2 `ACTIVE` variants -> `product.deactivateVariant(sku1, now)` | `sku1` becomes `INACTIVE`, `sku2` remains `ACTIVE`, `Product` remains `ACTIVE`, `aggregateVersion` increments by `+1`. |
-| **`UT-PRD-016`** | `Product` | Enforce `SkuCode` immutability after publication (`INV-PRD-2b`) | Activate product -> attempt `updateVariantSkuCode(skuId, newCode, now)` | Throws `ImmutableSkuCodeException`; `aggregateVersion` is unchanged. |
+| **`UT-PRD-016`** | `Product` | Enforce `SkuCode` immutability after publication (`INV-PRD-2b`) | Activate product -> attempt `updateVariantSkuCode(skuId, newCode, now)` | Throws `DomainException("IMMUTABLE_SKU_CODE", ...)`; `aggregateVersion` is unchanged. |
 | **`UT-PRD-017`** | `Product` | Update variant price when price changes (`INV-PRD-3`, `DOMAIN_MODEL.md`) | `product.updateVariantPrice(skuId, Money.of("179.99", USD), now)` | Variant `basePrice` updated, `aggregateVersion` incremented by `+1`, `ProductVariantPriceChanged` event recorded. |
-| **`UT-PRD-018`** | `Product` | Media replacement & primary media invariant (`VAL-PRD-6`) | `replaceMedia` with 2 items (`1` primary, `1` non-primary) vs `replaceMedia` with `0` primary or `2` primary items | Valid list updates media and increments version; `0` or `2` primary items throws `InvalidProductMediaException`. |
-| **`UT-PRD-019`** | `Product` | Archive product and reject all subsequent mutations (`VAL-PRD-8`, `OQ-CAT-001`) | `product.archive(now)` -> attempt `updateDetails(...)`, `addVariant(...)`, `updateVariantPrice(...)`, `activate(...)`, or `archive(...)` | Archive transitions status to terminal `ARCHIVED` and increments version; all subsequent operations throw `ArchivedProductModificationException`. |
+| **`UT-PRD-018`** | `Product` | Media replacement & primary media invariant (`VAL-PRD-6`) | `replaceMedia` with 2 items (`1` primary, `1` non-primary) vs `replaceMedia` with `0` primary or `2` primary items | Valid list updates media and increments version; `0` or `2` primary items throws `ValidationException("INVALID_PRODUCT_MEDIA", ...)`. |
+| **`UT-PRD-019`** | `Product` | Archive product and reject all subsequent mutations (`VAL-PRD-8`, `OQ-CAT-001`) | `product.archive(now)` -> attempt `updateDetails(...)`, `addVariant(...)`, `updateVariantPrice(...)`, `activate(...)`, or `archive(...)` | Archive transitions status to terminal `ARCHIVED` and increments version; all subsequent operations throw `DomainException("PRODUCT_ARCHIVED", ...)`. |
 | **`UT-PRD-020`** | `Product` | Collection encapsulation & immutability | Attempt `.clear()` or `.put(...)` on `product.variants()`, `product.media()`, or `product.attributes().values()` | Throws `UnsupportedOperationException`; internal aggregate state is uncorrupted. |
-| **`UT-PRD-021`** | `Product` | Enforce single `CurrencyCode` across all variants of one `Product` (`OQ-CAT-002`) | Add first variant with `Money.of("100.00", USD)` -> attempt `addVariant` or `updateVariantPrice` with `Money.of("250000", VND)` | Throws `InconsistentVariantCurrencyException`; `aggregateVersion` is unchanged and no domain event is emitted. |
+| **`UT-PRD-021`** | `Product` | Enforce single `CurrencyCode` across all variants of one `Product` (`OQ-CAT-002`) | Add first variant with `Money.of("100.00", USD)` -> attempt `addVariant` or `updateVariantPrice` with `Money.of("250000", VND)` | Throws `DomainException("INCONSISTENT_VARIANT_CURRENCY", ...)`; `aggregateVersion` is unchanged and no domain event is emitted. |
 | **`UT-PRD-022`** | `Product` | Updating variant price with an unchanged `Money` value is an idempotent no-op (`OQ-CAT-004`) | Variant has `Money.of("199.90", USD)` -> call `updateVariantPrice(skuId, Money.of("199.9", USD), laterInstant)` | Returns cleanly as an idempotent no-op: `aggregateVersion` does **not** increment, `updatedAt` does **not** change, and `pullDomainEvents()` is empty. |
 
 ---
@@ -430,9 +425,9 @@ All open questions from the initial draft have been resolved and accepted by the
 
 | Decision ID | Topic | Accepted Decision | Status |
 | :--- | :--- | :--- | :--- |
-| **`OQ-CAT-001`** | `ARCHIVED` Terminal State | `ARCHIVED` is strictly terminal. There is no unarchive operation; any mutating call on an `ARCHIVED` `Product` throws `ArchivedProductModificationException`. | **`DESIGN_ACCEPTED`** |
-| **`OQ-CAT-002`** | Single-Product Variant Currency Uniformity | All `ProductVariant`s belonging to one `Product` must use the same `CurrencyCode`. Adding or updating a variant with a mismatched `CurrencyCode` throws `InconsistentVariantCurrencyException`. | **`DESIGN_ACCEPTED`** |
-| **`OQ-CAT-003`** | Deactivating Last `ACTIVE` Variant on `ACTIVE` Product | Deactivating the last `ACTIVE` variant of an `ACTIVE` `Product` throws `ActiveProductRequiresActiveVariantException`. The `Product` never automatically reverts to `DRAFT`. | **`DESIGN_ACCEPTED`** |
+| **`OQ-CAT-001`** | `ARCHIVED` Terminal State | `ARCHIVED` is strictly terminal. There is no unarchive operation; any mutating call on an `ARCHIVED` `Product` throws `DomainException("PRODUCT_ARCHIVED", ...)`. | **`DESIGN_ACCEPTED`** |
+| **`OQ-CAT-002`** | Single-Product Variant Currency Uniformity | All `ProductVariant`s belonging to one `Product` must use the same `CurrencyCode`. Adding or updating a variant with a mismatched `CurrencyCode` throws `DomainException("INCONSISTENT_VARIANT_CURRENCY", ...)`. | **`DESIGN_ACCEPTED`** |
+| **`OQ-CAT-003`** | Deactivating Last `ACTIVE` Variant on `ACTIVE` Product | Deactivating the last `ACTIVE` variant of an `ACTIVE` `Product` throws `DomainException("PRODUCT_REQUIRES_ACTIVE_VARIANT", ...)`. The `Product` never automatically reverts to `DRAFT`. | **`DESIGN_ACCEPTED`** |
 | **`OQ-CAT-004`** | Idempotent No-Op on Unchanged Variant Price | Updating a variant price with an unchanged `Money` value is an idempotent no-op. More generally, `aggregateVersion` increments only when an actual aggregate state transition occurs, and an idempotent no-op must never emit a domain event or increment `aggregateVersion`. | **`DESIGN_ACCEPTED`** |
 | **`ARCH-CAT-001`** | `ProductRepository` Outbound Port Ownership & SKU Uniqueness Boundary | `ProductRepository` outbound port is moved from `Domain` to `Application` (`com.devatlas.commerce.catalog.application`). Domain-level SKU uniqueness applies strictly within one `Product` aggregate (`INV-PRD-2a`); global SKU uniqueness across `Product`s is enforced at the `Application`/`Infrastructure` persistence boundary. | **`DESIGN_ACCEPTED`** |
 
