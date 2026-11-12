@@ -13,8 +13,8 @@ mvn -B test
 
 echo "=== [3/5] Building & testing .NET 10 solution ==="
 cd "$REPO_ROOT"
-dotnet build DistributedCommerce.sln --nologo
-dotnet test DistributedCommerce.sln --nologo --no-build
+dotnet build DistributedCommerce.slnx --nologo
+dotnet test DistributedCommerce.slnx --nologo --no-build
 
 echo "=== [4/5] Testing, type-checking & linting Python 3.12+ AI Worker & Building Blocks ==="
 cd "$REPO_ROOT/src/workers/ai-worker"

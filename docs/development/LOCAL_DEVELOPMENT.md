@@ -29,7 +29,7 @@ export PATH="$HOME/.local/bin:$HOME/.dotnet:$PATH"
 ```text
 distributed-commerce-platform/
 ├── pom.xml                           # Root Maven parent POM (Java 21 + Spring Boot 3.4)
-├── DistributedCommerce.sln           # Root .NET 10 solution
+├── DistributedCommerce.slnx          # Root .NET 10 Solution (XML format)
 ├── Directory.Build.props             # Shared .NET 10 compiler & nullable/warning rules
 ├── src/
 │   ├── gateways/
@@ -92,7 +92,7 @@ mvn -pl src/services/catalog spring-boot:run
 From the repository root:
 ```bash
 # Restore, build, and execute xUnit tests
-dotnet test DistributedCommerce.sln
+dotnet test DistributedCommerce.slnx
 
 # Run a .NET 10 service locally
 dotnet run --project src/gateways/api-gateway/Commerce.ApiGateway

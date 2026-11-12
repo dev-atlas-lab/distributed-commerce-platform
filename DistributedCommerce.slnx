@@ -1,0 +1,27 @@
+<Solution>
+  <Configurations>
+    <Platform Name="Any CPU" />
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Folder Name="/src/" />
+  <Folder Name="/src/building-blocks/" />
+  <Folder Name="/src/building-blocks/dotnet/">
+    <Project Path="src/building-blocks/dotnet/Commerce.BuildingBlocks.Tests/Commerce.BuildingBlocks.Tests.csproj" />
+    <Project Path="src/building-blocks/dotnet/Commerce.BuildingBlocks/Commerce.BuildingBlocks.csproj" />
+  </Folder>
+  <Folder Name="/src/gateways/" />
+  <Folder Name="/src/gateways/api-gateway/">
+    <Project Path="src/gateways/api-gateway/Commerce.ApiGateway/Commerce.ApiGateway.csproj" />
+  </Folder>
+  <Folder Name="/src/services/" />
+  <Folder Name="/src/services/customer/">
+    <Project Path="src/services/customer/Commerce.Customer.Api/Commerce.Customer.Api.csproj" />
+  </Folder>
+  <Folder Name="/src/services/notification/">
+    <Project Path="src/services/notification/Commerce.Notification.Api/Commerce.Notification.Api.csproj" />
+  </Folder>
+  <Folder Name="/src/services/promotion/">
+    <Project Path="src/services/promotion/Commerce.Promotion.Api/Commerce.Promotion.Api.csproj" />
+  </Folder>
+</Solution>
