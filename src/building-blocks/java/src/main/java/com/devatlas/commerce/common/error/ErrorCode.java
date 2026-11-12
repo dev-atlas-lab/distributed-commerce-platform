@@ -7,7 +7,10 @@ package com.devatlas.commerce.common.error;
 public enum ErrorCode {
     /** General invalid request parameter or malformed argument. */
     INVALID_ARGUMENT("INVALID_ARGUMENT"),
-    /** Money amount must be strictly greater than zero and conform to currency decimal scale. */
+    /**
+     * Money amount must be strictly greater than zero and conform to currency
+     * decimal scale.
+     */
     INVALID_MONEY_AMOUNT("INVALID_MONEY_AMOUNT"),
     /** Domain entity identifier UUID is null or malformed. */
     INVALID_DOMAIN_IDENTIFIER("INVALID_DOMAIN_IDENTIFIER"),
@@ -25,6 +28,8 @@ public enum ErrorCode {
     INVALID_COUPON_CODE("INVALID_COUPON_CODE"),
     /** Search or agent query string is blank or invalid. */
     INVALID_QUERY("INVALID_QUERY"),
+    /** Attributes map is null, empty, or contains invalid keys/values. */
+    INVALID_ATTRIBUTES("INVALID_ATTRIBUTES"),
     /** Search query cannot be empty. */
     EMPTY_QUERY("EMPTY_QUERY"),
     /** Archived product is terminal and cannot be modified or published. */
